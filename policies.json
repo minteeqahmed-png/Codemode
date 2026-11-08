@@ -1,0 +1,14 @@
+{
+  "allowDelete": false,
+  "maxRequestsPerExecution": 25,
+  "blockedCidrs": [
+    "0.0.0.0/0",
+    "::/0"
+  ],
+  "protectedPathPrefixes": [
+    "/billing",
+    "/members",
+    "/iam"
+  ],
+  "blockInsecureHttpUrls": true
+}

@@ -1,0 +1,38 @@
+name: Jules Automated Code Scanner & Issue Generator
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Runs automatically every day at 09:00 UTC to keep Jules supplied with tasks
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+    inputs:
+      max_new_issues:
+        description: "Maximum number of new Jules issues to open in this run"
+        required: false
+        default: "2"
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  scan-and-open-issues:
+    name: Read Codebase & Open Issues for Jules
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Scan Codebase & Create Missing Jules Issues
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          MAX_NEW_ISSUES: ${{ github.event.inputs.max_new_issues || '2' }}
+        run: node src/auto-triage.ts

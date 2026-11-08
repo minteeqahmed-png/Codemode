@@ -1,0 +1,53 @@
+{
+  "name": "codemode",
+  "version": "0.1.0",
+  "description": "Turn any massive OpenAPI spec into a 2-tool Code Mode MCP server (search + execute) with 99.7% fewer tokens and built-in security guardrails.",
+  "author": {
+    "name": "Minteeq Ahmed",
+    "email": "minteeqahmed@gmail.com",
+    "url": "https://github.com/minteeqahmed-png"
+  },
+  "maintainers": [
+    {
+      "name": "Minteeq Ahmed",
+      "email": "minteeqahmed@gmail.com",
+      "url": "https://github.com/minteeqahmed-png"
+    }
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/minteeqahmed-png/Codemode.git"
+  },
+  "homepage": "https://github.com/minteeqahmed-png/Codemode#readme",
+  "bugs": {
+    "url": "https://github.com/minteeqahmed-png/Codemode/issues"
+  },
+  "type": "module",
+  "bin": {
+    "codemode": "./dist/server.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node src/server.ts",
+    "demo": "node src/demo.ts",
+    "triage": "node src/auto-triage.ts --dry-run"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "codemode",
+    "cloudflare",
+    "openapi",
+    "llm-tools"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

@@ -1,0 +1,26 @@
+name: CI & Policy Benchmark
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    name: Benchmark & Enterprise Policy Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Verify CLI Help
+        run: node src/server.ts --help
+
+      - name: Run 500-Endpoint Benchmark & Policy Guardrails
+        run: npm run demo
