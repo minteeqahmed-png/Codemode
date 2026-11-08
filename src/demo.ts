@@ -1,4 +1,4 @@
-import { CodeModeMcpServer } from "./server.ts";
+import { CodeModeMcpServer, API_PRESETS } from "./server.ts";
 import { indexOpenApiSpec, loadPolicyConfig } from "./index.ts";
 
 /**
@@ -173,8 +173,35 @@ async function runProofOfConcept() {
     console.log(`    - [${attempt.isError ? "BLOCKED" : "ALLOWED"}] ${t.label.padEnd(26)} -> ${JSON.parse(attempt.content[0].text).error}`);
   }
 
+  // 5. Test CLI API Presets (Cloudflare, GitHub, Stripe, Kubernetes)
+  console.log("\n[5] TESTING CLI API PRESETS (API_PRESETS Export & CLI flag parsing)");
+  const requiredPresets = ["cloudflare", "github", "stripe", "kubernetes"] as const;
+  for (const presetKey of requiredPresets) {
+    const preset = API_PRESETS[presetKey];
+    if (!preset) {
+      throw new Error(`Preset "${presetKey}" is missing from API_PRESETS`);
+    }
+    if (!preset.spec || !preset.spec.startsWith("https://")) {
+      throw new Error(`Preset "${presetKey}" has invalid spec URL: ${preset.spec}`);
+    }
+    if (!preset.baseUrl || !preset.baseUrl.startsWith("https://")) {
+      throw new Error(`Preset "${presetKey}" has invalid baseUrl: ${preset.baseUrl}`);
+    }
+    console.log(
+      `    - [VERIFIED] Preset '${presetKey.padEnd(10)}' -> ${preset.name} (${preset.baseUrl})`
+    );
+  }
+
+  const { parseCliArgs } = await import("./server.ts");
+  const parsedLong = parseCliArgs(["--preset", "github"]);
+  const parsedShort = parseCliArgs(["-P", "stripe"]);
+  if (parsedLong.preset !== "github" || parsedShort.preset !== "stripe") {
+    throw new Error(`CLI argument parsing failed for --preset or -P flags`);
+  }
+  console.log("    - [VERIFIED] CLI flags --preset and -P parsed correctly");
+
   console.log("\n==================================================================");
-  console.log("  ALL BENCHMARKS & 5 ENTERPRISE POLICIES PASSED");
+  console.log("  ALL BENCHMARKS, POLICIES & CLI PRESETS PASSED");
   console.log("==================================================================");
 }
 

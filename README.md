@@ -21,6 +21,10 @@ npm run demo
 
 ### 2. Connect Any OpenAPI URL or Local File via CLI
 ```bash
+# Using a popular API preset (cloudflare, github, stripe, kubernetes)
+node src/server.ts --preset github --dry-run
+
+# Or specifying a custom OpenAPI spec URL or file
 node src/server.ts --spec https://raw.githubusercontent.com/github/rest-api-description/main/descriptions/api.github.com/api.github.com.json --base-url https://api.github.com --dry-run
 ```
 
@@ -32,8 +36,8 @@ node src/server.ts --spec https://raw.githubusercontent.com/github/rest-api-desc
       "command": "node",
       "args": [
         "path/to/Codemode/src/server.ts",
-        "--spec",
-        "https://raw.githubusercontent.com/github/rest-api-description/main/descriptions/api.github.com/api.github.com.json"
+        "--preset",
+        "github"
       ],
       "env": {
         "API_TOKEN": "your_token_here"
