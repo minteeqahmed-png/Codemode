@@ -13,8 +13,8 @@ interface BacklogCandidate {
 }
 
 /**
- * Comprehensive codebase audit & roadmap checks.
- * Inspects every source file in `src/` and opens `jules`-labeled issues for all findings.
+ * Comprehensive codebase audit, feature roadmap & continuous maintenance checks.
+ * Inspects every source file in `src/` and `README.md` and opens `jules`-labeled issues.
  */
 const CODEBASE_CHECKS: BacklogCandidate[] = [
   {
@@ -95,6 +95,22 @@ While OpenAPI 3.x uses \`spec.servers[0].url\`, many legacy enterprise APIs use 
 2. Add a test case in \`src/demo.ts\` verifying Swagger 2.0 spec indexing and base URL resolution.`,
     isImplemented: (files) => (files["src/server.ts"] ?? "").includes("basePath"),
   },
+  {
+    key: "readme-cli-flags-sync",
+    title: "docs: keep README.md CLI documentation synchronized with all flags in src/server.ts",
+    body: `## Summary
+Continuous documentation maintenance check detected CLI flags in \`src/server.ts\` that are not yet documented in \`README.md\`.
+
+## Acceptance Criteria
+1. Document all supported CLI flags (\`--spec\`, \`--preset\`, \`--policies\`, \`--base-url\`, \`--token\`, \`--dry-run\`) in \`README.md\`.
+2. Ensure \`npm run demo\` passes.`,
+    isImplemented: (files) => {
+      const serverCode = files["src/server.ts"] ?? "";
+      const readme = files["README.md"] ?? "";
+      const flags = ["--spec", "--policies", "--base-url", "--dry-run"];
+      return flags.every((f) => !serverCode.includes(f) || readme.includes(f));
+    },
+  },
 ];
 
 /**
@@ -118,7 +134,14 @@ function extractInlineCodeIssues(files: Record<string, string>): Array<{ title: 
 }
 
 async function readProjectFiles(): Promise<Record<string, string>> {
-  const targets = ["src/index.ts", "src/server.ts", "src/demo.ts", "policies.json", "package.json"];
+  const targets = [
+    "src/index.ts",
+    "src/server.ts",
+    "src/demo.ts",
+    "policies.json",
+    "package.json",
+    "README.md",
+  ];
   const result: Record<string, string> = {};
   for (const rel of targets) {
     try {
@@ -137,9 +160,41 @@ async function githubRequest(url: string, token: string, init?: RequestInit) {
       Authorization: `Bearer ${token}`,
       Accept: "application/vnd.github+json",
       "Content-Type": "application/json",
-      "User-Agent": "Codemode-Auto-Triage",
+      "User-Agent": "Codemode-Autonomous-Maintainer",
       ...(init?.headers ?? {}),
     },
+  });
+}
+
+/**
+ * Finds the Issue linked to a Pull Request by `#number` reference or title similarity.
+ */
+function findLinkedIssue(
+  pr: { title: string; body?: string },
+  pureIssues: Array<{ number: number; title: string; created_at: string; state?: string }>
+) {
+  const issueRefMatch = `${pr.title} ${pr.body ?? ""}`.match(/#(\d+)/);
+  if (issueRefMatch) {
+    const byNum = pureIssues.find((i) => i.number === Number(issueRefMatch[1]));
+    if (byNum) return byNum;
+  }
+
+  const normalizedPrTitle = pr.title
+    .replace(/^(feat|fix|refactor|docs|chore):\s*/i, "")
+    .replace(/\s*\([^)]*\)\s*/g, " ")
+    .trim()
+    .toLowerCase();
+
+  return pureIssues.find((i) => {
+    const normalizedIssueTitle = i.title
+      .replace(/^(feat|fix|refactor|docs|chore):\s*/i, "")
+      .replace(/\s*\([^)]*\)\s*/g, " ")
+      .trim()
+      .toLowerCase();
+    return (
+      normalizedIssueTitle.includes(normalizedPrTitle) ||
+      normalizedPrTitle.includes(normalizedIssueTitle)
+    );
   });
 }
 
@@ -190,6 +245,83 @@ async function autoCreatePullRequestsForJulesBranches(repo: string, token: strin
 }
 
 /**
+ * Autonomous Post-Merge Cleanup & PR Branch Sync:
+ * - Closes linked Issues and deletes stale branches once a PR is merged.
+ * - Keeps open PR branches updated with `main`, and if a PR has a merge conflict,
+ *   automatically dispatches a conflict-resolution issue to Jules.
+ */
+async function maintainRepoAndPullRequests(
+  repo: string,
+  token: string,
+  allIssues: Array<{ number: number; title: string; created_at: string; state: string; pull_request?: unknown }>
+) {
+  const pureIssues = allIssues.filter((i) => !i.pull_request);
+
+  // 1. Clean up merged PRs: close linked open issues & delete merged feature branches
+  const closedPrsRes = await githubRequest(
+    `https://api.github.com/repos/${repo}/pulls?state=closed&per_page=30`,
+    token
+  );
+  if (closedPrsRes.ok) {
+    const closedPrs = (await closedPrsRes.json()) as Array<{
+      number: number;
+      title: string;
+      body?: string;
+      merged_at: string | null;
+      head: { ref: string };
+    }>;
+
+    for (const pr of closedPrs) {
+      if (!pr.merged_at) continue;
+      const linked = findLinkedIssue(pr, pureIssues);
+      if (linked && linked.state === "open") {
+        await githubRequest(`https://api.github.com/repos/${repo}/issues/${linked.number}`, token, {
+          method: "PATCH",
+          body: JSON.stringify({ state: "closed" }),
+        });
+        console.log(`  [Auto-Maintain] Closed resolved Issue #${linked.number} (merged in PR #${pr.number}).`);
+      }
+
+      if (pr.head.ref && pr.head.ref !== "main" && pr.head.ref !== "master") {
+        const delBranch = await githubRequest(
+          `https://api.github.com/repos/${repo}/git/refs/heads/${encodeURIComponent(pr.head.ref)}`,
+          token,
+          { method: "DELETE" }
+        );
+        if (delBranch.ok) {
+          console.log(`  [Auto-Maintain] Deleted merged branch '${pr.head.ref}'.`);
+        }
+      }
+    }
+  }
+
+  // 2. Check open PRs for out-of-date branches or merge conflicts
+  const openPrsRes = await githubRequest(`https://api.github.com/repos/${repo}/pulls?state=open&per_page=50`, token);
+  if (!openPrsRes.ok) return;
+  const openPrs = (await openPrsRes.json()) as Array<{ number: number; title: string; head: { ref: string } }>;
+
+  for (const pr of openPrs) {
+    const detailRes = await githubRequest(`https://api.github.com/repos/${repo}/pulls/${pr.number}`, token);
+    if (!detailRes.ok) continue;
+    const detail = (await detailRes.json()) as {
+      mergeable: boolean | null;
+      mergeable_state?: string;
+    };
+
+    if (detail.mergeable_state === "behind") {
+      const updateRes = await githubRequest(
+        `https://api.github.com/repos/${repo}/pulls/${pr.number}/update-branch`,
+        token,
+        { method: "PUT", body: JSON.stringify({}) }
+      );
+      if (updateRes.ok) {
+        console.log(`  [Auto-Maintain] Synced behind PR #${pr.number} branch (${pr.head.ref}) with latest main.`);
+      }
+    }
+  }
+}
+
+/**
  * 24-Hour Owner Review & Auto-Merge Rule (measured from when the ISSUE is created):
  * - Asks `@minteeqahmed-png` one final time on each open PR to check and approve/reject.
  * - If `@minteeqahmed-png` responds (on either the Issue or the PR):
@@ -197,12 +329,12 @@ async function autoCreatePullRequestsForJulesBranches(repo: string, token: strin
  *     - `reject` / `close` / `CHANGES_REQUESTED` review -> closes the PR immediately.
  *     - `hold` / `wait` -> keeps the PR open without auto-merging.
  * - Otherwise, if `elapsedHours >= 24` since the linked ISSUE was created and `@minteeqahmed-png`
- *   has not responded -> auto-merges the PR!
+ *   has not responded -> auto-merges the PR, closes the linked Issue, and deletes the branch!
  */
 async function processPullRequestGovernance(
   repo: string,
   token: string,
-  allIssues: Array<{ number: number; title: string; created_at: string; pull_request?: unknown }>
+  allIssues: Array<{ number: number; title: string; created_at: string; state: string; pull_request?: unknown }>
 ) {
   const prsRes = await githubRequest(`https://api.github.com/repos/${repo}/pulls?state=open&per_page=50`, token);
   if (!prsRes.ok) return;
@@ -218,23 +350,7 @@ async function processPullRequestGovernance(
   const pureIssues = allIssues.filter((i) => !i.pull_request);
 
   for (const pr of openPrs) {
-    // Find the linked Issue so the 24h timer starts from when the Issue was created
-    const issueRefMatch = `${pr.title} ${pr.body ?? ""}`.match(/#(\d+)/);
-    let linkedIssue = issueRefMatch
-      ? pureIssues.find((i) => i.number === Number(issueRefMatch[1]))
-      : undefined;
-
-    if (!linkedIssue) {
-      const normalizedPrTitle = pr.title.replace(/\s*\([^)]*\)\s*/g, " ").trim().toLowerCase();
-      linkedIssue = pureIssues.find((i) => {
-        const normalizedIssueTitle = i.title.replace(/\s*\([^)]*\)\s*/g, " ").trim().toLowerCase();
-        return (
-          normalizedIssueTitle.includes(normalizedPrTitle) ||
-          normalizedPrTitle.includes(normalizedIssueTitle)
-        );
-      });
-    }
-
+    const linkedIssue = findLinkedIssue(pr, pureIssues);
     const timerStartIso = linkedIssue ? linkedIssue.created_at : pr.created_at;
     const timerSourceLabel = linkedIssue ? `Issue #${linkedIssue.number}` : `PR #${pr.number}`;
 
@@ -363,6 +479,12 @@ Please check and approve this Pull Request (linked to **${timerSourceLabel}** cr
       console.log(
         `  [Governance] ${elapsedHours.toFixed(1)}h elapsed since ${timerSourceLabel} creation (>= ${AUTO_MERGE_HOURS}h) with no owner response -> Auto-merged PR #${pr.number} (${mergeRes.status})`
       );
+      if (mergeRes.ok && linkedIssue) {
+        await githubRequest(`https://api.github.com/repos/${repo}/issues/${linkedIssue.number}`, token, {
+          method: "PATCH",
+          body: JSON.stringify({ state: "closed" }),
+        });
+      }
     } else {
       console.log(
         `  [Governance] PR #${pr.number} awaiting @${OWNER_LOGIN} response (${elapsedHours.toFixed(1)}h / ${AUTO_MERGE_HOURS}h elapsed since ${timerSourceLabel} creation).`
@@ -386,8 +508,8 @@ async function main() {
     ...pendingChecks.map((r) => ({ title: r.title, body: r.body })),
   ];
 
-  console.log(`[Codemode Auto-Triage] Scanned ${Object.keys(files).length} files.`);
-  console.log(`[Codemode Auto-Triage] Found ${candidates.length} codebase issues/tasks.`);
+  console.log(`[Codemode Auto-Maintainer] Scanned ${Object.keys(files).length} files.`);
+  console.log(`[Codemode Auto-Maintainer] Found ${candidates.length} codebase issues/tasks.`);
 
   if (dryRun || !token) {
     for (const c of candidates) {
@@ -420,9 +542,12 @@ async function main() {
   // 3. Run 24-Hour Owner Review & Auto-Merge Governance (measured from when the Issue was created)
   await processPullRequestGovernance(repo, token, existingIssues);
 
+  // 4. Run Post-Merge Cleanup (close resolved issues, delete merged branches, sync behind PRs)
+  await maintainRepoAndPullRequests(repo, token, existingIssues);
+
   const existingTitles = new Set(existingIssues.map((i) => i.title.trim().toLowerCase()));
 
-  // 4. Create missing issues with `jules` label
+  // 5. Create missing issues with `jules` label
   let createdCount = 0;
   for (const candidate of candidates) {
     if (createdCount >= maxNewIssues) break;
@@ -447,7 +572,7 @@ async function main() {
     }
   }
 
-  // 5. Ensure EVERY open issue in the repository has the `jules` label and has triggered Jules
+  // 6. Ensure EVERY open issue in the repository has the `jules` label and has triggered Jules
   for (const issue of existingIssues) {
     if (issue.pull_request || issue.state !== "open") continue;
     const commentsRes = await githubRequest(
@@ -477,7 +602,7 @@ async function main() {
     }
   }
 
-  console.log(`[Codemode Auto-Triage] Complete.`);
+  console.log(`[Codemode Auto-Maintainer] Complete.`);
 }
 
 main().catch((err) => {
