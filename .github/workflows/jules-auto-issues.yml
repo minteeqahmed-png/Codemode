@@ -2,11 +2,6 @@ name: Jules Automated Code Scanner & Issue Generator
 
 on:
   push:
-    branches:
-      - main
-      - "feat/**"
-      - "fix/**"
-      - "refactor/**"
   issues:
     types: [opened, reopened]
   schedule:
