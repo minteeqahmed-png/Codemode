@@ -340,6 +340,8 @@ async function processPullRequestGovernance(
   if (!prsRes.ok) return;
   const openPrs = (await prsRes.json()) as Array<{
     number: number;
+    node_id: string;
+    draft?: boolean;
     title: string;
     body?: string;
     created_at: string;
@@ -350,6 +352,18 @@ async function processPullRequestGovernance(
   const pureIssues = allIssues.filter((i) => !i.pull_request);
 
   for (const pr of openPrs) {
+    // Automatically convert Draft PRs from Jules into Ready-for-Review PRs so they can be merged
+    if (pr.draft && pr.node_id) {
+      await githubRequest("https://api.github.com/graphql", token, {
+        method: "POST",
+        body: JSON.stringify({
+          query: `mutation($id: ID!) { markPullRequestReadyForReview(input: { pullRequestId: $id }) { pullRequest { isDraft } } }`,
+          variables: { id: pr.node_id },
+        }),
+      });
+      console.log(`  [Auto-Maintain] Marked Draft PR #${pr.number} as Ready for Review.`);
+    }
+
     const linkedIssue = findLinkedIssue(pr, pureIssues);
     const timerStartIso = linkedIssue ? linkedIssue.created_at : pr.created_at;
     const timerSourceLabel = linkedIssue ? `Issue #${linkedIssue.number}` : `PR #${pr.number}`;
