@@ -28,6 +28,20 @@ node src/server.ts --preset github --dry-run
 node src/server.ts --spec https://raw.githubusercontent.com/github/rest-api-description/main/descriptions/api.github.com/api.github.com.json --base-url https://api.github.com --dry-run
 ```
 
+## CLI Reference & Flags
+
+`src/server.ts` supports the following command-line flags and environment variable fallbacks:
+
+| Flag | Short | Description | Environment Variable |
+| --- | --- | --- | --- |
+| `--preset <name>` | `-P` | Use a built-in OpenAPI spec preset (`cloudflare`, `github`, `stripe`, `kubernetes`) | - |
+| `--spec <url-or-file>` | `-s` | Remote OpenAPI v3 JSON spec URL or local JSON file path | `OPENAPI_SPEC_PATH` |
+| `--base-url <url>` | `-b` | API base URL (overrides preset or spec server default) | `API_BASE_URL` |
+| `--token <api-token>` | `-t` | Bearer token passed in the `Authorization` header for requests | `API_TOKEN` |
+| `--policies <file>` | `-p` | Path to custom security policy JSON configuration file | `POLICIES_PATH` |
+| `--dry-run` | - | Simulate API calls inside `execute` sandbox without sending live network requests | `DRY_RUN` (`"true"`) |
+| `--help` | `-h` | Display CLI usage instructions and exit | - |
+
 ### 3. Add to Your MCP Client (`mcp_config.json`)
 ```json
 {
