@@ -190,34 +190,76 @@ async function autoCreatePullRequestsForJulesBranches(repo: string, token: strin
 }
 
 /**
- * 24-Hour Owner Review & Auto-Merge Rule:
+ * 24-Hour Owner Review & Auto-Merge Rule (measured from when the ISSUE is created):
  * - Asks `@minteeqahmed-png` one final time on each open PR to check and approve/reject.
- * - If `@minteeqahmed-png` responds (via PR review or comment):
+ * - If `@minteeqahmed-png` responds (on either the Issue or the PR):
  *     - `approve` / `merge` / `lgtm` / `APPROVED` review -> merges the PR immediately.
  *     - `reject` / `close` / `CHANGES_REQUESTED` review -> closes the PR immediately.
  *     - `hold` / `wait` -> keeps the PR open without auto-merging.
- * - Otherwise, if `elapsedHours >= 24` and `@minteeqahmed-png` has not responded -> auto-merges the PR!
+ * - Otherwise, if `elapsedHours >= 24` since the linked ISSUE was created and `@minteeqahmed-png`
+ *   has not responded -> auto-merges the PR!
  */
-async function processPullRequestGovernance(repo: string, token: string) {
+async function processPullRequestGovernance(
+  repo: string,
+  token: string,
+  allIssues: Array<{ number: number; title: string; created_at: string; pull_request?: unknown }>
+) {
   const prsRes = await githubRequest(`https://api.github.com/repos/${repo}/pulls?state=open&per_page=50`, token);
   if (!prsRes.ok) return;
   const openPrs = (await prsRes.json()) as Array<{
     number: number;
     title: string;
+    body?: string;
     created_at: string;
     head: { ref: string };
   }>;
 
   const promptMarker = "<!-- codemode-final-approval-prompt -->";
+  const pureIssues = allIssues.filter((i) => !i.pull_request);
 
   for (const pr of openPrs) {
+    // Find the linked Issue so the 24h timer starts from when the Issue was created
+    const issueRefMatch = `${pr.title} ${pr.body ?? ""}`.match(/#(\d+)/);
+    let linkedIssue = issueRefMatch
+      ? pureIssues.find((i) => i.number === Number(issueRefMatch[1]))
+      : undefined;
+
+    if (!linkedIssue) {
+      const normalizedPrTitle = pr.title.replace(/\s*\([^)]*\)\s*/g, " ").trim().toLowerCase();
+      linkedIssue = pureIssues.find((i) => {
+        const normalizedIssueTitle = i.title.replace(/\s*\([^)]*\)\s*/g, " ").trim().toLowerCase();
+        return (
+          normalizedIssueTitle.includes(normalizedPrTitle) ||
+          normalizedPrTitle.includes(normalizedIssueTitle)
+        );
+      });
+    }
+
+    const timerStartIso = linkedIssue ? linkedIssue.created_at : pr.created_at;
+    const timerSourceLabel = linkedIssue ? `Issue #${linkedIssue.number}` : `PR #${pr.number}`;
+
     const commentsRes = await githubRequest(
       `https://api.github.com/repos/${repo}/issues/${pr.number}/comments?per_page=100`,
       token
     );
-    const comments = commentsRes.ok
+    const prComments = commentsRes.ok
       ? ((await commentsRes.json()) as Array<{ user?: { login?: string }; body?: string; created_at?: string }>)
       : [];
+
+    let issueComments: Array<{ user?: { login?: string }; body?: string; created_at?: string }> = [];
+    if (linkedIssue) {
+      const issueCommentsRes = await githubRequest(
+        `https://api.github.com/repos/${repo}/issues/${linkedIssue.number}/comments?per_page=100`,
+        token
+      );
+      if (issueCommentsRes.ok) {
+        issueComments = (await issueCommentsRes.json()) as Array<{
+          user?: { login?: string };
+          body?: string;
+          created_at?: string;
+        }>;
+      }
+    }
 
     const reviewsRes = await githubRequest(
       `https://api.github.com/repos/${repo}/pulls/${pr.number}/reviews?per_page=100`,
@@ -228,17 +270,17 @@ async function processPullRequestGovernance(repo: string, token: string) {
       : [];
 
     // 1. Send final approval prompt to owner if not yet sent
-    const hasPrompt = comments.some((c) => (c.body ?? "").includes(promptMarker));
+    const hasPrompt = prComments.some((c) => (c.body ?? "").includes(promptMarker));
     if (!hasPrompt) {
       const promptBody = `${promptMarker}
 ### Final Maintainer Review Request (@${OWNER_LOGIN})
 
-Please check and approve this Pull Request:
+Please check and approve this Pull Request (linked to **${timerSourceLabel}** created at \`${timerStartIso}\`):
 - Reply **\`approve\`** (or submit an approving review) to **merge immediately**.
 - Reply **\`reject\`** (or **\`close\`**) to **close this PR**.
 - Reply **\`hold\`** to **pause auto-merge**.
 
-> **24-Hour Auto-Merge Rule**: If @${OWNER_LOGIN} does not respond within **${AUTO_MERGE_HOURS} hours**, this Pull Request will be **merged automatically**.`;
+> **24-Hour Issue Timer Rule**: If @${OWNER_LOGIN} does not respond within **${AUTO_MERGE_HOURS} hours of ${timerSourceLabel} being created**, this Pull Request will be **merged automatically**.`;
 
       await githubRequest(`https://api.github.com/repos/${repo}/issues/${pr.number}/comments`, token, {
         method: "POST",
@@ -247,8 +289,9 @@ Please check and approve this Pull Request:
       console.log(`  [Governance] Posted final approval prompt for @${OWNER_LOGIN} on PR #${pr.number}`);
     }
 
-    // 2. Check if owner (@minteeqahmed-png) responded via review or comment
-    const ownerComments = comments.filter(
+    // 2. Check if owner (@minteeqahmed-png) responded via review or comment (on Issue or PR)
+    const combinedComments = [...issueComments, ...prComments];
+    const ownerComments = combinedComments.filter(
       (c) =>
         (c.user?.login ?? "").toLowerCase() === OWNER_LOGIN.toLowerCase() &&
         !(c.body ?? "").includes(promptMarker)
@@ -301,8 +344,8 @@ Please check and approve this Pull Request:
       continue;
     }
 
-    // 3. No owner response yet: check if 24 hours have elapsed
-    const createdTime = new Date(pr.created_at).getTime();
+    // 3. No owner response yet: check if 24 hours have elapsed since the ISSUE was created
+    const createdTime = new Date(timerStartIso).getTime();
     const elapsedHours = (Date.now() - createdTime) / (1000 * 60 * 60);
 
     if (elapsedHours >= AUTO_MERGE_HOURS) {
@@ -312,17 +355,17 @@ Please check and approve this Pull Request:
         {
           method: "PUT",
           body: JSON.stringify({
-            commit_title: `${pr.title} (#${pr.number}) [24h Auto-Merge]`,
+            commit_title: `${pr.title} (#${pr.number}) [24h Issue Timer Auto-Merge]`,
             merge_method: "squash",
           }),
         }
       );
       console.log(
-        `  [Governance] ${elapsedHours.toFixed(1)}h elapsed (>= ${AUTO_MERGE_HOURS}h) with no owner response -> Auto-merged PR #${pr.number} (${mergeRes.status})`
+        `  [Governance] ${elapsedHours.toFixed(1)}h elapsed since ${timerSourceLabel} creation (>= ${AUTO_MERGE_HOURS}h) with no owner response -> Auto-merged PR #${pr.number} (${mergeRes.status})`
       );
     } else {
       console.log(
-        `  [Governance] PR #${pr.number} awaiting @${OWNER_LOGIN} response (${elapsedHours.toFixed(1)}h / ${AUTO_MERGE_HOURS}h elapsed).`
+        `  [Governance] PR #${pr.number} awaiting @${OWNER_LOGIN} response (${elapsedHours.toFixed(1)}h / ${AUTO_MERGE_HOURS}h elapsed since ${timerSourceLabel} creation).`
       );
     }
   }
@@ -356,10 +399,7 @@ async function main() {
   // 1. Auto-open PRs for any finished Jules branches
   await autoCreatePullRequestsForJulesBranches(repo, token);
 
-  // 2. Run 24-Hour Owner Review & Auto-Merge Governance on all open PRs
-  await processPullRequestGovernance(repo, token);
-
-  // 3. Fetch existing issues so we never duplicate an issue
+  // 2. Fetch existing issues (with created_at timestamps)
   const existingRes = await githubRequest(
     `https://api.github.com/repos/${repo}/issues?state=all&per_page=100`,
     token
@@ -372,9 +412,14 @@ async function main() {
     title: string;
     number: number;
     state: string;
+    created_at: string;
     pull_request?: unknown;
     labels: Array<{ name: string }>;
   }>;
+
+  // 3. Run 24-Hour Owner Review & Auto-Merge Governance (measured from when the Issue was created)
+  await processPullRequestGovernance(repo, token, existingIssues);
+
   const existingTitles = new Set(existingIssues.map((i) => i.title.trim().toLowerCase()));
 
   // 4. Create missing issues with `jules` label
