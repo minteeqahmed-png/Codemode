@@ -9,8 +9,10 @@ import {
   executeCodeMode,
   defaultAuditPolicies,
   loadPolicyConfig,
+  readPolicyConfigFile,
   type OpenApiEndpoint,
   type PolicyRule,
+  type PolicyConfigFile,
 } from "./index.ts";
 
 /**
@@ -23,6 +25,7 @@ export class CodeModeMcpServer {
   private headers: Record<string, string>;
   private policies: PolicyRule[];
   private dryRun: boolean;
+  private timeoutMs?: number;
 
   constructor(options: {
     spec: Record<string, any>;
@@ -30,6 +33,7 @@ export class CodeModeMcpServer {
     headers?: Record<string, string>;
     policies?: PolicyRule[];
     dryRun?: boolean;
+    timeoutMs?: number;
   }) {
     this.endpoints = indexOpenApiSpec(options.spec);
     this.baseUrl =
@@ -39,6 +43,7 @@ export class CodeModeMcpServer {
     this.headers = options.headers ?? {};
     this.policies = options.policies ?? defaultAuditPolicies;
     this.dryRun = options.dryRun ?? false;
+    this.timeoutMs = options.timeoutMs;
   }
 
   /**
@@ -114,6 +119,7 @@ export class CodeModeMcpServer {
           headers: this.headers,
           policies: this.policies,
           dryRun: this.dryRun,
+          timeoutMs: this.timeoutMs,
         });
         return {
           content: [
@@ -243,6 +249,7 @@ export function parseCliArgs(argv: string[]) {
     baseUrl?: string;
     token?: string;
     policies?: string;
+    timeoutMs?: number;
     dryRun?: boolean;
     help?: boolean;
   } = {};
@@ -253,6 +260,10 @@ export function parseCliArgs(argv: string[]) {
     else if (arg === "--base-url" || arg === "-b") args.baseUrl = argv[++i];
     else if (arg === "--token" || arg === "-t") args.token = argv[++i];
     else if (arg === "--policies" || arg === "-p") args.policies = argv[++i];
+    else if (arg === "--timeout-ms") {
+      const val = argv[++i];
+      args.timeoutMs = val !== undefined ? Number(val) : undefined;
+    }
     else if (arg === "--dry-run") args.dryRun = true;
     else if (arg === "--help" || arg === "-h") args.help = true;
   }
@@ -263,7 +274,7 @@ async function main() {
   const cli = parseCliArgs(process.argv.slice(2));
   if (cli.help) {
     console.log(
-      `Usage: codemode [--preset <name> | --spec <url-or-file>] [--policies <policies.json>] [--base-url <url>] [--token <api-token>] [--dry-run]`
+      `Usage: codemode [--preset <name> | --spec <url-or-file>] [--policies <policies.json>] [--timeout-ms <ms>] [--base-url <url>] [--token <api-token>] [--dry-run]`
     );
     console.log(`\nOptions:`);
     console.log(`  -P, --preset <name>       Preset OpenAPI spec (${Object.keys(API_PRESETS).join(", ")})`);
@@ -271,6 +282,7 @@ async function main() {
     console.log(`  -b, --base-url <url>      API base URL (overrides preset or spec default)`);
     console.log(`  -t, --token <api-token>   Bearer token for API authorization`);
     console.log(`  -p, --policies <file>     Custom policies JSON configuration path`);
+    console.log(`      --timeout-ms <ms>     Sandbox VM execution timeout in milliseconds`);
     console.log(`      --dry-run             Simulate API execution without firing live HTTP calls`);
     console.log(`  -h, --help                Show this help message`);
     return;
@@ -292,15 +304,22 @@ async function main() {
   }
 
   const spec = await loadOpenApiSpec(specSource);
-  const policies = await loadPolicyConfig(cli.policies ?? process.env.POLICIES_PATH);
+  const policyPath = cli.policies ?? process.env.POLICIES_PATH;
+  const policyConfig = await readPolicyConfigFile(policyPath);
+  const policies = await loadPolicyConfig(policyPath);
   const token = cli.token ?? process.env.API_TOKEN;
   const baseUrl = cli.baseUrl ?? preset?.baseUrl ?? process.env.API_BASE_URL;
+  const timeoutMs =
+    cli.timeoutMs ??
+    policyConfig?.timeoutMs ??
+    (process.env.TIMEOUT_MS ? Number(process.env.TIMEOUT_MS) : undefined);
   const server = new CodeModeMcpServer({
     spec,
     baseUrl,
     headers: token ? { Authorization: `Bearer ${token}` } : {},
     policies,
     dryRun: cli.dryRun ?? process.env.DRY_RUN === "true",
+    timeoutMs,
   });
   server.startStdio();
 }

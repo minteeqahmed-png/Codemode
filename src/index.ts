@@ -29,6 +29,7 @@ export interface PolicyConfigFile {
   blockedCidrs?: string[];
   protectedPathPrefixes?: string[];
   blockInsecureHttpUrls?: boolean;
+  timeoutMs?: number;
 }
 
 /**
@@ -124,12 +125,20 @@ export function buildAuditPolicies(config?: PolicyConfigFile): PolicyRule[] {
 export const defaultAuditPolicies: PolicyRule[] = buildAuditPolicies();
 
 /**
+ * Reads a policy JSON configuration file if provided.
+ */
+export async function readPolicyConfigFile(policyPath?: string): Promise<PolicyConfigFile | undefined> {
+  if (!policyPath) return undefined;
+  const raw = await fs.readFile(policyPath, "utf8");
+  return JSON.parse(raw) as PolicyConfigFile;
+}
+
+/**
  * Loads custom policy overrides from a JSON file if provided.
  */
 export async function loadPolicyConfig(policyPath?: string): Promise<PolicyRule[]> {
   if (!policyPath) return defaultAuditPolicies;
-  const raw = await fs.readFile(policyPath, "utf8");
-  const parsed = JSON.parse(raw) as PolicyConfigFile;
+  const parsed = await readPolicyConfigFile(policyPath);
   return buildAuditPolicies(parsed);
 }
 
@@ -190,10 +199,12 @@ export async function executeCodeMode(
     headers?: Record<string, string>;
     policies?: PolicyRule[];
     dryRun?: boolean;
+    timeoutMs?: number;
   }
 ) {
   const auditLog: Array<{ method: string; path: string; status: string; reason?: string }> = [];
   const policies = options.policies ?? defaultAuditPolicies;
+  const timeoutMs = options.timeoutMs ?? 5000;
   let requestCount = 0;
 
   const apiHelper = {
@@ -236,7 +247,7 @@ export async function executeCodeMode(
   });
 
   const wrappedScript = `(async () => { ${code} })()`;
-  const result = await vm.runInContext(wrappedScript, sandbox, { timeout: 5000 });
+  const result = await vm.runInContext(wrappedScript, sandbox, { timeout: timeoutMs });
 
   return {
     result,
