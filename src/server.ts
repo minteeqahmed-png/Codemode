@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import fs from "node:fs/promises";
 import readline from "node:readline";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   indexOpenApiSpec,
   searchSpec,
@@ -183,6 +185,43 @@ export class CodeModeMcpServer {
 }
 
 /**
+ * Built-in presets for popular OpenAPI specifications.
+ */
+export interface ApiPreset {
+  spec: string;
+  baseUrl: string;
+  name: string;
+  description?: string;
+}
+
+export const API_PRESETS: Record<"cloudflare" | "github" | "stripe" | "kubernetes", ApiPreset> = {
+  cloudflare: {
+    name: "Cloudflare",
+    spec: "https://raw.githubusercontent.com/cloudflare/api-schemas/main/openapi.json",
+    baseUrl: "https://api.cloudflare.com/client/v4",
+    description: "Cloudflare Client API v4",
+  },
+  github: {
+    name: "GitHub",
+    spec: "https://raw.githubusercontent.com/github/rest-api-description/main/descriptions/api.github.com/api.github.com.json",
+    baseUrl: "https://api.github.com",
+    description: "GitHub REST API v3",
+  },
+  stripe: {
+    name: "Stripe",
+    spec: "https://raw.githubusercontent.com/stripe/openapi/master/openapi/spec3.json",
+    baseUrl: "https://api.stripe.com",
+    description: "Stripe REST API",
+  },
+  kubernetes: {
+    name: "Kubernetes",
+    spec: "https://raw.githubusercontent.com/kubernetes/kubernetes/master/api/openapi-spec/swagger.json",
+    baseUrl: "https://kubernetes.default.svc",
+    description: "Kubernetes Cluster API",
+  },
+};
+
+/**
  * Loads an OpenAPI v3 JSON specification from either a remote HTTPS URL or a local file path.
  */
 export async function loadOpenApiSpec(specSource: string): Promise<Record<string, any>> {
@@ -197,8 +236,9 @@ export async function loadOpenApiSpec(specSource: string): Promise<Record<string
   return JSON.parse(raw);
 }
 
-function parseCliArgs(argv: string[]) {
+export function parseCliArgs(argv: string[]) {
   const args: {
+    preset?: string;
     spec?: string;
     baseUrl?: string;
     token?: string;
@@ -208,7 +248,8 @@ function parseCliArgs(argv: string[]) {
   } = {};
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === "--spec" || arg === "-s") args.spec = argv[++i];
+    if (arg === "--preset" || arg === "-P") args.preset = argv[++i];
+    else if (arg === "--spec" || arg === "-s") args.spec = argv[++i];
     else if (arg === "--base-url" || arg === "-b") args.baseUrl = argv[++i];
     else if (arg === "--token" || arg === "-t") args.token = argv[++i];
     else if (arg === "--policies" || arg === "-p") args.policies = argv[++i];
@@ -222,22 +263,41 @@ async function main() {
   const cli = parseCliArgs(process.argv.slice(2));
   if (cli.help) {
     console.log(
-      `Usage: codemode --spec <url-or-file> [--policies <policies.json>] [--base-url <url>] [--token <api-token>] [--dry-run]`
+      `Usage: codemode [--preset <name> | --spec <url-or-file>] [--policies <policies.json>] [--base-url <url>] [--token <api-token>] [--dry-run]`
     );
+    console.log(`\nOptions:`);
+    console.log(`  -P, --preset <name>       Preset OpenAPI spec (${Object.keys(API_PRESETS).join(", ")})`);
+    console.log(`  -s, --spec <url-or-file>  OpenAPI v3 JSON specification URL or local file path`);
+    console.log(`  -b, --base-url <url>      API base URL (overrides preset or spec default)`);
+    console.log(`  -t, --token <api-token>   Bearer token for API authorization`);
+    console.log(`  -p, --policies <file>     Custom policies JSON configuration path`);
+    console.log(`      --dry-run             Simulate API execution without firing live HTTP calls`);
+    console.log(`  -h, --help                Show this help message`);
     return;
   }
 
-  const specSource = cli.spec ?? process.env.OPENAPI_SPEC_PATH;
+  const presetKey = cli.preset ? (cli.preset.toLowerCase() as keyof typeof API_PRESETS) : undefined;
+  const preset = presetKey ? API_PRESETS[presetKey] : undefined;
+  if (cli.preset && !preset) {
+    console.error(
+      `Unknown preset "${cli.preset}". Supported presets are: ${Object.keys(API_PRESETS).join(", ")}`
+    );
+    process.exit(1);
+  }
+
+  const specSource = cli.spec ?? preset?.spec ?? process.env.OPENAPI_SPEC_PATH;
   if (!specSource) {
-    return;
+    console.error("Error: Please provide --preset <name> or --spec <url-or-file>.");
+    process.exit(1);
   }
 
   const spec = await loadOpenApiSpec(specSource);
   const policies = await loadPolicyConfig(cli.policies ?? process.env.POLICIES_PATH);
   const token = cli.token ?? process.env.API_TOKEN;
+  const baseUrl = cli.baseUrl ?? preset?.baseUrl ?? process.env.API_BASE_URL;
   const server = new CodeModeMcpServer({
     spec,
-    baseUrl: cli.baseUrl ?? process.env.API_BASE_URL,
+    baseUrl,
     headers: token ? { Authorization: `Bearer ${token}` } : {},
     policies,
     dryRun: cli.dryRun ?? process.env.DRY_RUN === "true",
@@ -245,7 +305,13 @@ async function main() {
   server.startStdio();
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+const isDirectExecution =
+  process.argv[1] &&
+  fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+
+if (isDirectExecution) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
