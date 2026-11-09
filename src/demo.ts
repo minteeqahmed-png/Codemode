@@ -195,10 +195,35 @@ async function runProofOfConcept() {
   const { parseCliArgs } = await import("./server.ts");
   const parsedLong = parseCliArgs(["--preset", "github"]);
   const parsedShort = parseCliArgs(["-P", "stripe"]);
+  const parsedTimeout = parseCliArgs(["--timeout-ms", "1500"]);
   if (parsedLong.preset !== "github" || parsedShort.preset !== "stripe") {
     throw new Error(`CLI argument parsing failed for --preset or -P flags`);
   }
+  if (parsedTimeout.timeoutMs !== 1500) {
+    throw new Error(`CLI argument parsing failed for --timeout-ms flag`);
+  }
   console.log("    - [VERIFIED] CLI flags --preset and -P parsed correctly");
+  console.log("    - [VERIFIED] CLI flag --timeout-ms parsed correctly");
+
+  // 6. Test Sandbox VM Timeout Enforcement
+  console.log("\n[6] TESTING SANDBOX EXECUTION TIMEOUT ENFORCEMENT");
+  const timeoutServer = new CodeModeMcpServer({
+    spec,
+    policies,
+    dryRun: true,
+    timeoutMs: 150,
+  });
+  const timeoutRes = await timeoutServer.handleToolCall("execute", {
+    code: `while (true) {}`,
+  });
+  if (!timeoutRes.isError) {
+    throw new Error("Expected infinite loop execution to be terminated by timeout, but it succeeded");
+  }
+  const timeoutErrText = JSON.parse(timeoutRes.content[0].text).error;
+  if (!timeoutErrText.includes("timed out")) {
+    throw new Error(`Expected timeout error message, got: ${timeoutErrText}`);
+  }
+  console.log(`    - [VERIFIED] Configured VM execution timeout enforced (${timeoutErrText})`);
 
   console.log("\n==================================================================");
   console.log("  ALL BENCHMARKS, POLICIES & CLI PRESETS PASSED");

@@ -10,5 +10,6 @@
     "/members",
     "/iam"
   ],
-  "blockInsecureHttpUrls": true
+  "blockInsecureHttpUrls": true,
+  "timeoutMs": 5000
 }
