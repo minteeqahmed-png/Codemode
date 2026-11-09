@@ -1,12 +1,18 @@
-name: Jules Automated Code Scanner & Issue Generator
+name: Jules Automated Code Scanner, PR Governance & 24h Auto-Merge
 
 on:
   push:
   issues:
     types: [opened, reopened]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  pull_request_review:
+    types: [submitted]
+  issue_comment:
+    types: [created]
   schedule:
-    # Runs automatically every 6 hours to scan the codebase, trigger Jules, and open PRs
-    - cron: "0 */6 * * *"
+    # Runs every hour to enforce the 24-hour PR auto-merge timer and scan for new tasks
+    - cron: "0 * * * *"
   workflow_dispatch:
     inputs:
       max_new_issues:
@@ -20,8 +26,8 @@ permissions:
   pull-requests: write
 
 jobs:
-  scan-and-open-issues:
-    name: Scan Codebase, Trigger Jules & Auto-Open PRs
+  scan-and-govern:
+    name: Codebase Scan, Final Owner Check & 24h Auto-Merge
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -34,7 +40,7 @@ jobs:
         with:
           node-version: "24"
 
-      - name: Scan Codebase, Trigger Jules on Every Issue & Auto-Create PRs
+      - name: Run Auto-Triage & 24h PR Governance
         env:
           GITHUB_TOKEN: ${{ secrets.JULES_TRIGGER_TOKEN || secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}

@@ -2,6 +2,9 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
+const OWNER_LOGIN = "minteeqahmed-png";
+const AUTO_MERGE_HOURS = 24;
+
 interface BacklogCandidate {
   key: string;
   title: string;
@@ -157,7 +160,6 @@ async function autoCreatePullRequestsForJulesBranches(repo: string, token: strin
     if (branch.name === "main" || branch.name === "master") continue;
     if (openPrBranches.has(branch.name)) continue;
 
-    // Compare branch with main to ensure it has ahead commits before opening a PR
     const cmpRes = await githubRequest(
       `https://api.github.com/repos/${repo}/compare/main...${encodeURIComponent(branch.name)}`,
       token
@@ -183,6 +185,145 @@ async function autoCreatePullRequestsForJulesBranches(repo: string, token: strin
     if (createPr.ok) {
       const created = (await createPr.json()) as { number: number; html_url: string };
       console.log(`  [Auto-PR] Opened PR #${created.number} for branch ${branch.name}: ${created.html_url}`);
+    }
+  }
+}
+
+/**
+ * 24-Hour Owner Review & Auto-Merge Rule:
+ * - Asks `@minteeqahmed-png` one final time on each open PR to check and approve/reject.
+ * - If `@minteeqahmed-png` responds (via PR review or comment):
+ *     - `approve` / `merge` / `lgtm` / `APPROVED` review -> merges the PR immediately.
+ *     - `reject` / `close` / `CHANGES_REQUESTED` review -> closes the PR immediately.
+ *     - `hold` / `wait` -> keeps the PR open without auto-merging.
+ * - Otherwise, if `elapsedHours >= 24` and `@minteeqahmed-png` has not responded -> auto-merges the PR!
+ */
+async function processPullRequestGovernance(repo: string, token: string) {
+  const prsRes = await githubRequest(`https://api.github.com/repos/${repo}/pulls?state=open&per_page=50`, token);
+  if (!prsRes.ok) return;
+  const openPrs = (await prsRes.json()) as Array<{
+    number: number;
+    title: string;
+    created_at: string;
+    head: { ref: string };
+  }>;
+
+  const promptMarker = "<!-- codemode-final-approval-prompt -->";
+
+  for (const pr of openPrs) {
+    const commentsRes = await githubRequest(
+      `https://api.github.com/repos/${repo}/issues/${pr.number}/comments?per_page=100`,
+      token
+    );
+    const comments = commentsRes.ok
+      ? ((await commentsRes.json()) as Array<{ user?: { login?: string }; body?: string; created_at?: string }>)
+      : [];
+
+    const reviewsRes = await githubRequest(
+      `https://api.github.com/repos/${repo}/pulls/${pr.number}/reviews?per_page=100`,
+      token
+    );
+    const reviews = reviewsRes.ok
+      ? ((await reviewsRes.json()) as Array<{ user?: { login?: string }; state?: string; body?: string }>)
+      : [];
+
+    // 1. Send final approval prompt to owner if not yet sent
+    const hasPrompt = comments.some((c) => (c.body ?? "").includes(promptMarker));
+    if (!hasPrompt) {
+      const promptBody = `${promptMarker}
+### Final Maintainer Review Request (@${OWNER_LOGIN})
+
+Please check and approve this Pull Request:
+- Reply **\`approve\`** (or submit an approving review) to **merge immediately**.
+- Reply **\`reject\`** (or **\`close\`**) to **close this PR**.
+- Reply **\`hold\`** to **pause auto-merge**.
+
+> **24-Hour Auto-Merge Rule**: If @${OWNER_LOGIN} does not respond within **${AUTO_MERGE_HOURS} hours**, this Pull Request will be **merged automatically**.`;
+
+      await githubRequest(`https://api.github.com/repos/${repo}/issues/${pr.number}/comments`, token, {
+        method: "POST",
+        body: JSON.stringify({ body: promptBody }),
+      });
+      console.log(`  [Governance] Posted final approval prompt for @${OWNER_LOGIN} on PR #${pr.number}`);
+    }
+
+    // 2. Check if owner (@minteeqahmed-png) responded via review or comment
+    const ownerComments = comments.filter(
+      (c) =>
+        (c.user?.login ?? "").toLowerCase() === OWNER_LOGIN.toLowerCase() &&
+        !(c.body ?? "").includes(promptMarker)
+    );
+    const ownerReviews = reviews.filter(
+      (r) => (r.user?.login ?? "").toLowerCase() === OWNER_LOGIN.toLowerCase()
+    );
+
+    let ownerDecision: "approve" | "reject" | "hold" | null = null;
+
+    for (const rev of ownerReviews) {
+      if (rev.state === "APPROVED") ownerDecision = "approve";
+      else if (rev.state === "CHANGES_REQUESTED") ownerDecision = "reject";
+    }
+
+    for (const c of ownerComments) {
+      const text = (c.body ?? "").trim().toLowerCase();
+      if (/\b(approve|approved|merge|lgtm|yes)\b/.test(text)) ownerDecision = "approve";
+      else if (/\b(reject|rejected|close|no)\b/.test(text)) ownerDecision = "reject";
+      else if (/\b(hold|wait|pause)\b/.test(text)) ownerDecision = "hold";
+    }
+
+    if (ownerDecision === "approve") {
+      const mergeRes = await githubRequest(
+        `https://api.github.com/repos/${repo}/pulls/${pr.number}/merge`,
+        token,
+        {
+          method: "PUT",
+          body: JSON.stringify({
+            commit_title: `${pr.title} (#${pr.number})`,
+            merge_method: "squash",
+          }),
+        }
+      );
+      console.log(`  [Governance] Owner @${OWNER_LOGIN} APPROVED PR #${pr.number} -> Merge status: ${mergeRes.status}`);
+      continue;
+    }
+
+    if (ownerDecision === "reject") {
+      await githubRequest(`https://api.github.com/repos/${repo}/pulls/${pr.number}`, token, {
+        method: "PATCH",
+        body: JSON.stringify({ state: "closed" }),
+      });
+      console.log(`  [Governance] Owner @${OWNER_LOGIN} REJECTED PR #${pr.number} -> Closed PR.`);
+      continue;
+    }
+
+    if (ownerDecision === "hold") {
+      console.log(`  [Governance] Owner @${OWNER_LOGIN} placed PR #${pr.number} on HOLD.`);
+      continue;
+    }
+
+    // 3. No owner response yet: check if 24 hours have elapsed
+    const createdTime = new Date(pr.created_at).getTime();
+    const elapsedHours = (Date.now() - createdTime) / (1000 * 60 * 60);
+
+    if (elapsedHours >= AUTO_MERGE_HOURS) {
+      const mergeRes = await githubRequest(
+        `https://api.github.com/repos/${repo}/pulls/${pr.number}/merge`,
+        token,
+        {
+          method: "PUT",
+          body: JSON.stringify({
+            commit_title: `${pr.title} (#${pr.number}) [24h Auto-Merge]`,
+            merge_method: "squash",
+          }),
+        }
+      );
+      console.log(
+        `  [Governance] ${elapsedHours.toFixed(1)}h elapsed (>= ${AUTO_MERGE_HOURS}h) with no owner response -> Auto-merged PR #${pr.number} (${mergeRes.status})`
+      );
+    } else {
+      console.log(
+        `  [Governance] PR #${pr.number} awaiting @${OWNER_LOGIN} response (${elapsedHours.toFixed(1)}h / ${AUTO_MERGE_HOURS}h elapsed).`
+      );
     }
   }
 }
@@ -215,7 +356,10 @@ async function main() {
   // 1. Auto-open PRs for any finished Jules branches
   await autoCreatePullRequestsForJulesBranches(repo, token);
 
-  // 2. Fetch existing issues so we never duplicate an issue
+  // 2. Run 24-Hour Owner Review & Auto-Merge Governance on all open PRs
+  await processPullRequestGovernance(repo, token);
+
+  // 3. Fetch existing issues so we never duplicate an issue
   const existingRes = await githubRequest(
     `https://api.github.com/repos/${repo}/issues?state=all&per_page=100`,
     token
@@ -233,7 +377,7 @@ async function main() {
   }>;
   const existingTitles = new Set(existingIssues.map((i) => i.title.trim().toLowerCase()));
 
-  // 3. Create missing issues with `jules` label
+  // 4. Create missing issues with `jules` label
   let createdCount = 0;
   for (const candidate of candidates) {
     if (createdCount >= maxNewIssues) break;
@@ -258,7 +402,7 @@ async function main() {
     }
   }
 
-  // 4. Ensure EVERY open issue in the repository has the `jules` label and has triggered Jules
+  // 5. Ensure EVERY open issue in the repository has the `jules` label and has triggered Jules
   for (const issue of existingIssues) {
     if (issue.pull_request || issue.state !== "open") continue;
     const commentsRes = await githubRequest(
