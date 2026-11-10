@@ -37,14 +37,33 @@ export class CodeModeMcpServer {
     timeoutMs?: number;
   }) {
     this.endpoints = indexOpenApiSpec(options.spec);
-    this.baseUrl =
-      options.baseUrl ??
-      options.spec.servers?.[0]?.url ??
-      "https://api.cloudflare.com/client/v4";
+    this.baseUrl = this.resolveBaseUrl(options.spec, options.baseUrl);
     this.headers = options.headers ?? {};
     this.policies = options.policies ?? defaultAuditPolicies;
     this.dryRun = options.dryRun ?? false;
     this.timeoutMs = options.timeoutMs;
+  }
+
+  /**
+   * Resolves the base URL from an explicit override, OpenAPI 3.x `servers`, or Swagger 2.0 host/basePath/schemes.
+   */
+  private resolveBaseUrl(spec: Record<string, any>, explicitBaseUrl?: string): string {
+    if (explicitBaseUrl) return explicitBaseUrl;
+    if (spec?.servers?.[0]?.url) return spec.servers[0].url;
+
+    // Swagger 2.0 resolution: schemes + host + basePath
+    if (spec?.host) {
+      const scheme = spec.schemes?.[0] ?? "https";
+      const rawBasePath = spec.basePath ?? "";
+      const cleanBasePath = rawBasePath
+        ? rawBasePath.startsWith("/")
+          ? rawBasePath
+          : `/${rawBasePath}`
+        : "";
+      return `${scheme}://${spec.host}${cleanBasePath}`.replace(/\/+$/, "");
+    }
+
+    return "https://api.cloudflare.com/client/v4";
   }
 
   /**

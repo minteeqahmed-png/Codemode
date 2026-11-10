@@ -223,7 +223,21 @@ export async function executeCodeMode(
         return { dryRun: true, method, path, body };
       }
 
-      const url = new URL(path, options.baseUrl).toString();
+      let url: string;
+      if (path.startsWith("http://") || path.startsWith("https://")) {
+        url = new URL(path).toString();
+      } else {
+        const base = new URL(options.baseUrl);
+        const basePath = base.pathname.replace(/\/+$/, "");
+        const [pathname, search] = path.split("?");
+        const cleanPath = pathname.startsWith("/") ? pathname : `/${pathname}`;
+        base.pathname = `${basePath}${cleanPath}`;
+        if (search !== undefined) {
+          base.search = search ? `?${search}` : "";
+        }
+        url = base.toString();
+      }
+
       const response = await fetch(url, {
         method: method.toUpperCase(),
         headers: {
