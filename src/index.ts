@@ -30,6 +30,7 @@ export interface PolicyConfigFile {
   protectedPathPrefixes?: string[];
   blockInsecureHttpUrls?: boolean;
   timeoutMs?: number;
+  maxResponseBytes?: number;
 }
 
 /**
@@ -200,11 +201,13 @@ export async function executeCodeMode(
     policies?: PolicyRule[];
     dryRun?: boolean;
     timeoutMs?: number;
+    maxResponseBytes?: number;
   }
 ) {
   const auditLog: Array<{ method: string; path: string; status: string; reason?: string }> = [];
   const policies = options.policies ?? defaultAuditPolicies;
   const timeoutMs = options.timeoutMs ?? 5000;
+  const maxResponseBytes = options.maxResponseBytes ?? 32768;
   let requestCount = 0;
 
   const apiHelper = {
@@ -263,8 +266,26 @@ export async function executeCodeMode(
   const wrappedScript = `(async () => { ${code} })()`;
   const result = await vm.runInContext(wrappedScript, sandbox, { timeout: timeoutMs });
 
+  const serialized = typeof result === "string" ? result : JSON.stringify(result);
+  const totalBytes = serialized !== undefined ? Buffer.byteLength(serialized, "utf8") : 0;
+
+  if (totalBytes > maxResponseBytes) {
+    const truncatedText = Buffer.from(serialized, "utf8")
+      .subarray(0, maxResponseBytes)
+      .toString("utf8");
+
+    return {
+      result: truncatedText,
+      truncated: true,
+      originalBytes: totalBytes,
+      maxResponseBytes,
+      auditLog,
+    };
+  }
+
   return {
     result,
+    truncated: false,
     auditLog,
   };
 }

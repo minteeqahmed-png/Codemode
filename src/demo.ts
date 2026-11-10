@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { CodeModeMcpServer, API_PRESETS, loadOpenApiSpec } from "./server.ts";
-import { indexOpenApiSpec, loadPolicyConfig } from "./index.ts";
+import { indexOpenApiSpec, loadPolicyConfig, executeCodeMode } from "./index.ts";
 
 /**
  * Generates a realistic multi-service Cloud Infrastructure OpenAPI v3 specification
@@ -365,6 +365,56 @@ paths:
     throw new Error(`Execution failed on Swagger 2.0 server: ${JSON.stringify(parsedSwaggerExec)}`);
   }
   console.log("    - [VERIFIED] Base URL derived from Swagger 2.0 (https://petstore.swagger.io/v2)");
+
+  // 9. Test maxResponseBytes Truncation Guardrail
+  console.log("\n[9] TESTING MAX RESPONSE BYTES TRUNCATION GUARDRAIL");
+  const oversizedScript = `
+    const largeArray = new Array(1000).fill("A".repeat(100));
+    return { data: largeArray };
+  `;
+  const defaultTruncRes = await server.handleToolCall("execute", { code: oversizedScript });
+  const parsedTruncated = JSON.parse(defaultTruncRes.content[0].text);
+  if (!parsedTruncated.truncated) {
+    throw new Error(`Expected oversized response to be truncated, but truncated was false`);
+  }
+  if (typeof parsedTruncated.result !== "string") {
+    throw new Error(`Expected truncated result to be string`);
+  }
+  if (Buffer.byteLength(parsedTruncated.result, "utf8") > 32768) {
+    throw new Error(`Truncated result exceeded maxResponseBytes (32768)`);
+  }
+  console.log(
+    `    - [VERIFIED] Oversized payload (${parsedTruncated.originalBytes} bytes) truncated to ${Buffer.byteLength(parsedTruncated.result, "utf8")} bytes (truncated: true)`
+  );
+
+  const customTruncOutcome = await executeCodeMode(
+    `return { message: "x".repeat(500) };`,
+    {
+      baseUrl: "https://api.example.com",
+      maxResponseBytes: 128,
+    }
+  );
+  if (!customTruncOutcome.truncated) {
+    throw new Error(`Expected custom maxResponseBytes output to be truncated`);
+  }
+  if (Buffer.byteLength(customTruncOutcome.result as string, "utf8") > 128) {
+    throw new Error(`Custom truncated output exceeded maxResponseBytes (128)`);
+  }
+  console.log(
+    `    - [VERIFIED] Custom maxResponseBytes limit (128 bytes) enforced (truncated: true)`
+  );
+
+  const normalOutcome = await executeCodeMode(
+    `return { message: "hello world" };`,
+    {
+      baseUrl: "https://api.example.com",
+      maxResponseBytes: 32768,
+    }
+  );
+  if (normalOutcome.truncated) {
+    throw new Error(`Expected normal payload to not be truncated`);
+  }
+  console.log(`    - [VERIFIED] Normal payload remains untruncated (truncated: false)`);
 
   console.log("\n==================================================================");
   console.log("  ALL BENCHMARKS, POLICIES & CLI PRESETS PASSED");
