@@ -1,6 +1,9 @@
 # AGENTS.md — Codemode Repository Guide
 
-This file provides context, commands, and architectural rules for AI coding agents (including Google **Jules**) working on **Codemode**.
+> **Standing Autonomous Agent Prompt:**
+> *"Monitor the repository, create issues for detected bugs or tech debt, draft pull requests for fixes, and maintain code quality standards automatically."*
+
+This file provides context, commands, and architectural rules for AI coding agents (including Antigravity and Google **Jules**) working on **Codemode**.
 
 ## Project Overview
 **Codemode** (`codemode`) turns massive OpenAPI v3 specifications (Cloudflare, GitHub, Stripe, Kubernetes, Jira) into a 2-tool **Code Mode MCP Server** (`search` + `execute`) with 99.7% fewer prompt tokens and sandboxed security guardrails.

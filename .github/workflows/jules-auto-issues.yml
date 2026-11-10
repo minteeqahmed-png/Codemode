@@ -40,9 +40,10 @@ jobs:
         with:
           node-version: "24"
 
-      - name: Run Auto-Triage & 24h PR Governance
+      - name: Run Auto-Triage, Gemini AI Solver & 24h PR Governance
         env:
           GITHUB_TOKEN: ${{ secrets.JULES_TRIGGER_TOKEN || secrets.GITHUB_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           MAX_NEW_ISSUES: ${{ github.event.inputs.max_new_issues || '10' }}
         run: node src/auto-triage.ts
