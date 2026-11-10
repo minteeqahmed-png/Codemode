@@ -1,0 +1,50 @@
+name: Two-Step Verification (Antigravity -> Codex -> Owner)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  step1-verify-and-test:
+    name: "Step 1: Antigravity Code & Benchmark Verification"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Test CLI Interface
+        run: node src/server.ts --help
+
+      - name: Run Full 500-Endpoint Benchmark & Policy Suite
+        run: npm run demo
+
+  step2-codex-review:
+    name: "Step 2: Codex Code Review & Audit"
+    needs: step1-verify-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Execute Codex Reviewer Engine
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: node src/codex-review.ts

@@ -3,6 +3,16 @@
 > **Standing Autonomous Agent Prompt:**
 > *"Monitor the repository, create issues for detected bugs or tech debt, draft pull requests for fixes, and maintain code quality standards automatically."*
 
+## Two-Step Verification Pipeline
+This repository enforces a structured **Two-Step Verification Workflow** before merging:
+1. **Step 1 (Anti-gravity / Implementer):** An automated agent (Anti-gravity / Google AI Studio / contributor) creates the solution, tests it, and opens a Pull Request.
+2. **Step 2 (Codex Reviewer):** An automated OpenAI Codex engine (`src/codex-review.ts` and `.github/workflows/two-step-verification.yml`) reviews the PR diff for:
+   - Strict 2-tool MCP limit (`search` + `execute`).
+   - Sandbox security & policy enforcement (no unvalidated execution or timeouts).
+   - Zero-dependency footprint.
+   - Strict TypeScript types (no unchecked `any`).
+3. **Step 3 (Owner Approval):** The maintainer (@minteeqahmed-png) inspects the Codex review scorecard and gives the final approval (`approve` / `reject`).
+
 This file provides context, commands, and architectural rules for AI coding agents (including Antigravity and Google **Jules**) working on **Codemode**.
 
 ## Project Overview

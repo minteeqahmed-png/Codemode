@@ -30,6 +30,7 @@
     "build": "tsc",
     "start": "node src/server.ts",
     "demo": "node src/demo.ts",
+    "review": "node src/codex-review.ts",
     "triage": "node src/auto-triage.ts --dry-run"
   },
   "keywords": [
