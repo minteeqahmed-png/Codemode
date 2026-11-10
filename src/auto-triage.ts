@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs/promises";
 import path from "node:path";
-import { postOrUpdateCodexPrComment } from "./codex-review.ts";
+import { postOrUpdateCodexPrComment, CODEX_COMMENT_MARKER } from "./codex-review.ts";
 
 const OWNER_LOGIN = "minteeqahmed-png";
 const AUTO_MERGE_HOURS = 24;
@@ -423,13 +423,17 @@ Please check and approve this Pull Request (linked to **${timerSourceLabel}** cr
       console.log(`  [Governance] Posted final approval prompt for @${OWNER_LOGIN} on PR #${pr.number}`);
     }
 
-    // 2. Check if owner (@minteeqahmed-png) responded via review or comment (on Issue or PR)
+    // 2. Check if owner (@minteeqahmed-png) responded via review or a human command comment (on Issue or PR)
     const combinedComments = [...issueComments, ...prComments];
-    const ownerComments = combinedComments.filter(
-      (c) =>
+    const ownerComments = combinedComments.filter((c) => {
+      const body = c.body ?? "";
+      return (
         (c.user?.login ?? "").toLowerCase() === OWNER_LOGIN.toLowerCase() &&
-        !(c.body ?? "").includes(promptMarker)
-    );
+        !body.includes(promptMarker) &&
+        !body.includes(CODEX_COMMENT_MARKER) &&
+        !body.includes("Two-Step Verification")
+      );
+    });
     const ownerReviews = reviews.filter(
       (r) => (r.user?.login ?? "").toLowerCase() === OWNER_LOGIN.toLowerCase()
     );
@@ -443,9 +447,9 @@ Please check and approve this Pull Request (linked to **${timerSourceLabel}** cr
 
     for (const c of ownerComments) {
       const text = (c.body ?? "").trim().toLowerCase();
-      if (/\b(approve|approved|merge|lgtm|yes)\b/.test(text)) ownerDecision = "approve";
-      else if (/\b(reject|rejected|close|no)\b/.test(text)) ownerDecision = "reject";
-      else if (/\b(hold|wait|pause)\b/.test(text)) ownerDecision = "hold";
+      if (/^(approve|approved|merge|lgtm|yes)\b/.test(text)) ownerDecision = "approve";
+      else if (/^(reject|rejected|close|no)\b/.test(text)) ownerDecision = "reject";
+      else if (/^(hold|wait|pause)\b/.test(text)) ownerDecision = "hold";
     }
 
     if (ownerDecision === "approve") {
