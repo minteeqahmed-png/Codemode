@@ -3,14 +3,16 @@ import fs from "node:fs/promises";
 import readline from "node:readline";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-function parseSimpleYaml(text: string): Record<string, any> {
+function parseSimpleYaml(text: string): OpenApiSpec {
   const lines = text
     .split(/\r?\n/)
     .map((l) => l.replace(/#.*$/, ""))
     .filter((l) => l.trim().length > 0);
-  const root: Record<string, any> = {};
-  const stack: Array<{ indent: number; container: any }> = [{ indent: -1, container: root }];
-  const parseScalar = (val: string): any => {
+  const root: Record<string, unknown> = {};
+  const stack: Array<{ indent: number; container: Record<string, unknown> | unknown[] }> = [
+    { indent: -1, container: root },
+  ];
+  const parseScalar = (val: string): unknown => {
     const t = val.trim();
     if ((t.startsWith("'") && t.endsWith("'")) || (t.startsWith('"') && t.endsWith('"'))) return t.slice(1, -1);
     if (t === "true") return true;
@@ -29,20 +31,20 @@ function parseSimpleYaml(text: string): Record<string, any> {
       continue;
     }
     const colonIdx = trimmed.indexOf(":");
-    if (colonIdx !== -1) {
+    if (colonIdx !== -1 && !Array.isArray(parent)) {
       const key = String(parseScalar(trimmed.slice(0, colonIdx)));
       const rest = trimmed.slice(colonIdx + 1).trim();
       if (rest.length > 0) {
         parent[key] = parseScalar(rest);
       } else {
         const nextTrimmed = lines[i + 1] ? lines[i + 1].trim() : "";
-        const child = nextTrimmed.startsWith("- ") ? [] : {};
+        const child: Record<string, unknown> | unknown[] = nextTrimmed.startsWith("- ") ? [] : {};
         parent[key] = child;
         stack.push({ indent, container: child });
       }
     }
   }
-  return root;
+  return root as OpenApiSpec;
 }
 const YAML = { parse: parseSimpleYaml };
 import {
@@ -53,9 +55,22 @@ import {
   loadPolicyConfig,
   readPolicyConfigFile,
   type OpenApiEndpoint,
+  type OpenApiSpec,
   type PolicyRule,
   type PolicyConfigFile,
 } from "./index.ts";
+
+export interface JsonRpcMessage {
+  jsonrpc?: string;
+  id?: string | number;
+  method?: string;
+  params?: {
+    name?: string;
+    arguments?: Record<string, unknown>;
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
+}
 
 /**
  * Lightweight, zero-bloat MCP Stdio Server implementing Cloudflare's Code Mode pattern
@@ -71,7 +86,7 @@ export class CodeModeMcpServer {
   private maxResponseBytes: number;
 
   constructor(options: {
-    spec: Record<string, any>;
+    spec: OpenApiSpec;
     baseUrl?: string;
     headers?: Record<string, string>;
     policies?: PolicyRule[];
@@ -91,7 +106,7 @@ export class CodeModeMcpServer {
   /**
    * Resolves the base URL from an explicit override, OpenAPI 3.x `servers`, or Swagger 2.0 host/basePath/schemes.
    */
-  private resolveBaseUrl(spec: Record<string, any>, explicitBaseUrl?: string): string {
+  private resolveBaseUrl(spec: OpenApiSpec, explicitBaseUrl?: string): string {
     if (explicitBaseUrl) return explicitBaseUrl;
     if (spec?.servers?.[0]?.url) return spec.servers[0].url;
 
@@ -155,9 +170,10 @@ export class CodeModeMcpServer {
     ];
   }
 
-  public async handleToolCall(name: string, args: Record<string, any>) {
+  public async handleToolCall(name: string, args: Record<string, unknown>) {
     if (name === "search") {
-      const matches = searchSpec(this.endpoints, String(args.query ?? ""), args.method);
+      const methodFilter = typeof args.method === "string" ? args.method : undefined;
+      const matches = searchSpec(this.endpoints, String(args.query ?? ""), methodFilter);
       return {
         content: [
           {
@@ -194,13 +210,14 @@ export class CodeModeMcpServer {
             },
           ],
         };
-      } catch (err: any) {
+      } catch (err) {
+        const errorMessage = err instanceof Error ? err.message : String(err);
         return {
           isError: true,
           content: [
             {
               type: "text",
-              text: JSON.stringify({ error: err?.message ?? String(err) }, null, 2),
+              text: JSON.stringify({ error: errorMessage }, null, 2),
             },
           ],
         };
@@ -219,9 +236,9 @@ export class CodeModeMcpServer {
 
     rl.on("line", async (line) => {
       if (!line.trim()) return;
-      let msg: any;
+      let msg: JsonRpcMessage | undefined;
       try {
-        msg = JSON.parse(line);
+        msg = JSON.parse(line) as JsonRpcMessage;
         if (msg.method === "initialize") {
           this.sendResponse(msg.id, {
             protocolVersion: "2024-11-05",
@@ -231,18 +248,22 @@ export class CodeModeMcpServer {
         } else if (msg.method === "tools/list") {
           this.sendResponse(msg.id, { tools: this.getTools() });
         } else if (msg.method === "tools/call") {
-          const res = await this.handleToolCall(msg.params?.name, msg.params?.arguments ?? {});
+          const res = await this.handleToolCall(
+            msg.params?.name ?? "",
+            msg.params?.arguments ?? {}
+          );
           this.sendResponse(msg.id, res);
         } else if (msg.id !== undefined) {
           this.sendResponse(msg.id, {});
         }
-      } catch (err: any) {
+      } catch (err) {
         if (msg?.id !== undefined) {
+          const errorMessage = err instanceof Error ? err.message : String(err);
           process.stdout.write(
             JSON.stringify({
               jsonrpc: "2.0",
               id: msg.id,
-              error: { code: -32603, message: err?.message ?? "Internal error" },
+              error: { code: -32603, message: errorMessage },
             }) + "\n"
           );
         }
@@ -250,7 +271,7 @@ export class CodeModeMcpServer {
     });
   }
 
-  private sendResponse(id: string | number, result: unknown) {
+  private sendResponse(id: string | number | undefined, result: unknown) {
     process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\n");
   }
 }
@@ -295,7 +316,7 @@ export const API_PRESETS: Record<"cloudflare" | "github" | "stripe" | "kubernete
 /**
  * Loads an OpenAPI v3 JSON or YAML specification from either a remote HTTPS URL or a local file path.
  */
-export async function loadOpenApiSpec(specSource: string): Promise<Record<string, any>> {
+export async function loadOpenApiSpec(specSource: string): Promise<OpenApiSpec> {
   let raw: string;
   let isYaml = false;
 
@@ -319,17 +340,17 @@ export async function loadOpenApiSpec(specSource: string): Promise<Record<string
   }
 
   if (isYaml) {
-    return YAML.parse(raw) as Record<string, any>;
+    return YAML.parse(raw);
   }
 
   try {
-    return JSON.parse(raw);
+    return JSON.parse(raw) as OpenApiSpec;
   } catch (err) {
     // If JSON parsing fails, attempt parsing as YAML as fallback
     try {
       const parsed = YAML.parse(raw);
       if (parsed && typeof parsed === "object") {
-        return parsed as Record<string, any>;
+        return parsed;
       }
     } catch {
       // Re-throw original JSON parse error if YAML parse also fails

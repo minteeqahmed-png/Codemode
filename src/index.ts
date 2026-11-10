@@ -1,6 +1,39 @@
 import vm from "node:vm";
 import fs from "node:fs/promises";
 
+export interface OpenApiOperation {
+  operationId?: string;
+  summary?: string;
+  description?: string;
+  tags?: string[];
+  parameters?: unknown[];
+  requestBody?: unknown;
+  [key: string]: unknown;
+}
+
+export interface OpenApiServer {
+  url: string;
+  description?: string;
+  [key: string]: unknown;
+}
+
+export interface OpenApiSpec {
+  openapi?: string;
+  swagger?: string;
+  host?: string;
+  basePath?: string;
+  schemes?: string[];
+  info?: {
+    title: string;
+    version: string;
+    description?: string;
+    [key: string]: unknown;
+  };
+  servers?: OpenApiServer[];
+  paths?: Record<string, Record<string, OpenApiOperation | unknown>>;
+  [key: string]: unknown;
+}
+
 export interface OpenApiEndpoint {
   method: string;
   path: string;
@@ -146,22 +179,24 @@ export async function loadPolicyConfig(policyPath?: string): Promise<PolicyRule[
 /**
  * Parses an OpenAPI v3 document into a compact searchable index.
  */
-export function indexOpenApiSpec(spec: Record<string, any>): OpenApiEndpoint[] {
+export function indexOpenApiSpec(spec: OpenApiSpec): OpenApiEndpoint[] {
   const endpoints: OpenApiEndpoint[] = [];
   const paths = spec.paths ?? {};
 
-  for (const [pathKey, methods] of Object.entries<Record<string, any>>(paths)) {
-    for (const [httpMethod, details] of Object.entries<Record<string, any>>(methods)) {
+  for (const [pathKey, methods] of Object.entries(paths)) {
+    if (!methods || typeof methods !== "object") continue;
+    for (const [httpMethod, details] of Object.entries(methods)) {
       if (["get", "post", "put", "patch", "delete"].includes(httpMethod.toLowerCase())) {
+        const op = (details && typeof details === "object" ? details : {}) as OpenApiOperation;
         endpoints.push({
           method: httpMethod.toUpperCase(),
           path: pathKey,
-          operationId: details.operationId,
-          summary: details.summary,
-          description: details.description,
-          tags: details.tags,
-          parameters: details.parameters,
-          requestBody: details.requestBody,
+          operationId: op.operationId,
+          summary: op.summary,
+          description: op.description,
+          tags: op.tags,
+          parameters: op.parameters,
+          requestBody: op.requestBody,
         });
       }
     }
