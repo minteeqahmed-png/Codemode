@@ -1,4 +1,7 @@
-import { CodeModeMcpServer, API_PRESETS } from "./server.ts";
+import fs from "node:fs/promises";
+import path from "node:path";
+import os from "node:os";
+import { CodeModeMcpServer, API_PRESETS, loadOpenApiSpec } from "./server.ts";
 import { indexOpenApiSpec, loadPolicyConfig } from "./index.ts";
 
 /**
@@ -224,6 +227,69 @@ async function runProofOfConcept() {
     throw new Error(`Expected timeout error message, got: ${timeoutErrText}`);
   }
   console.log(`    - [VERIFIED] Configured VM execution timeout enforced (${timeoutErrText})`);
+
+  // 6. Test YAML OpenAPI Specification Loading (.yaml and .yml)
+  console.log("\n[6] TESTING YAML OPENAPI SPECIFICATION LOADING");
+  const sampleYamlSpec = `
+openapi: 3.0.0
+info:
+  title: Kubernetes Sample API
+  version: 1.28.0
+paths:
+  /api/v1/namespaces/{namespace}/pods:
+    get:
+      operationId: listNamespacedPod
+      summary: list or watch objects of kind Pod
+      tags:
+        - core
+      responses:
+        '200':
+          description: OK
+    post:
+      operationId: createNamespacedPod
+      summary: create a Pod
+      tags:
+        - core
+      responses:
+        '201':
+          description: Created
+`;
+
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codemode-yaml-test-"));
+  const tmpYamlFile = path.join(tmpDir, "k8s-spec.yaml");
+  const tmpYmlFile = path.join(tmpDir, "stripe-spec.yml");
+  try {
+    await fs.writeFile(tmpYamlFile, sampleYamlSpec, "utf8");
+    await fs.writeFile(tmpYmlFile, sampleYamlSpec, "utf8");
+
+    const loadedYaml = await loadOpenApiSpec(tmpYamlFile);
+    const loadedYml = await loadOpenApiSpec(tmpYmlFile);
+
+    if (loadedYaml.info?.title !== "Kubernetes Sample API") {
+      throw new Error(`YAML spec loading failed: unexpected title "${loadedYaml.info?.title}"`);
+    }
+    if (loadedYml.info?.title !== "Kubernetes Sample API") {
+      throw new Error(`.yml spec loading failed: unexpected title "${loadedYml.info?.title}"`);
+    }
+
+    const yamlEndpoints = indexOpenApiSpec(loadedYaml);
+    if (yamlEndpoints.length !== 2) {
+      throw new Error(`Expected 2 indexed endpoints from YAML spec, got ${yamlEndpoints.length}`);
+    }
+
+    const yamlServer = new CodeModeMcpServer({ spec: loadedYaml, dryRun: true });
+    const searchResult = await yamlServer.handleToolCall("search", { query: "pod" });
+    const parsedYamlSearch = JSON.parse(searchResult.content[0].text);
+    if (parsedYamlSearch.matchCount !== 2) {
+      throw new Error(`Expected 2 matches from YAML server search, got ${parsedYamlSearch.matchCount}`);
+    }
+
+    console.log("    - [VERIFIED] .yaml and .yml OpenAPI v3 specs parsed successfully");
+    console.log(`    - [VERIFIED] Indexed ${yamlEndpoints.length} endpoints from YAML specification`);
+    console.log(`    - [VERIFIED] CodeModeMcpServer search query returned ${parsedYamlSearch.matchCount} matched endpoints`);
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
 
   console.log("\n==================================================================");
   console.log("  ALL BENCHMARKS, POLICIES & CLI PRESETS PASSED");

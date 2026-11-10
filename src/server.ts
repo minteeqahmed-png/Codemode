@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import readline from "node:readline";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import YAML from "yaml";
 import {
   indexOpenApiSpec,
   searchSpec,
@@ -228,18 +229,49 @@ export const API_PRESETS: Record<"cloudflare" | "github" | "stripe" | "kubernete
 };
 
 /**
- * Loads an OpenAPI v3 JSON specification from either a remote HTTPS URL or a local file path.
+ * Loads an OpenAPI v3 JSON or YAML specification from either a remote HTTPS URL or a local file path.
  */
 export async function loadOpenApiSpec(specSource: string): Promise<Record<string, any>> {
+  let raw: string;
+  let isYaml = false;
+
   if (specSource.startsWith("http://") || specSource.startsWith("https://")) {
     const res = await fetch(specSource);
     if (!res.ok) {
       throw new Error(`Failed to fetch OpenAPI spec from ${specSource}: ${res.status} ${res.statusText}`);
     }
-    return (await res.json()) as Record<string, any>;
+    const contentType = res.headers.get("content-type") ?? "";
+    const urlPath = new URL(specSource).pathname.toLowerCase();
+    isYaml =
+      urlPath.endsWith(".yaml") ||
+      urlPath.endsWith(".yml") ||
+      contentType.includes("yaml") ||
+      contentType.includes("x-yaml");
+    raw = await res.text();
+  } else {
+    const lowerPath = specSource.toLowerCase();
+    isYaml = lowerPath.endsWith(".yaml") || lowerPath.endsWith(".yml");
+    raw = await fs.readFile(specSource, "utf8");
   }
-  const raw = await fs.readFile(specSource, "utf8");
-  return JSON.parse(raw);
+
+  if (isYaml) {
+    return YAML.parse(raw) as Record<string, any>;
+  }
+
+  try {
+    return JSON.parse(raw);
+  } catch (err) {
+    // If JSON parsing fails, attempt parsing as YAML as fallback
+    try {
+      const parsed = YAML.parse(raw);
+      if (parsed && typeof parsed === "object") {
+        return parsed as Record<string, any>;
+      }
+    } catch {
+      // Re-throw original JSON parse error if YAML parse also fails
+    }
+    throw err;
+  }
 }
 
 export function parseCliArgs(argv: string[]) {
@@ -278,7 +310,7 @@ async function main() {
     );
     console.log(`\nOptions:`);
     console.log(`  -P, --preset <name>       Preset OpenAPI spec (${Object.keys(API_PRESETS).join(", ")})`);
-    console.log(`  -s, --spec <url-or-file>  OpenAPI v3 JSON specification URL or local file path`);
+    console.log(`  -s, --spec <url-or-file>  OpenAPI v3 JSON/YAML specification URL or local file path`);
     console.log(`  -b, --base-url <url>      API base URL (overrides preset or spec default)`);
     console.log(`  -t, --token <api-token>   Bearer token for API authorization`);
     console.log(`  -p, --policies <file>     Custom policies JSON configuration path`);
