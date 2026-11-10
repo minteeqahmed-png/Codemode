@@ -11,5 +11,6 @@
     "/iam"
   ],
   "blockInsecureHttpUrls": true,
-  "timeoutMs": 5000
+  "timeoutMs": 5000,
+  "maxResponseBytes": 32768
 }

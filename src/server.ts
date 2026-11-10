@@ -68,6 +68,7 @@ export class CodeModeMcpServer {
   private policies: PolicyRule[];
   private dryRun: boolean;
   private timeoutMs?: number;
+  private maxResponseBytes: number;
 
   constructor(options: {
     spec: Record<string, any>;
@@ -76,6 +77,7 @@ export class CodeModeMcpServer {
     policies?: PolicyRule[];
     dryRun?: boolean;
     timeoutMs?: number;
+    maxResponseBytes?: number;
   }) {
     this.endpoints = indexOpenApiSpec(options.spec);
     this.baseUrl = this.resolveBaseUrl(options.spec, options.baseUrl);
@@ -83,6 +85,7 @@ export class CodeModeMcpServer {
     this.policies = options.policies ?? defaultAuditPolicies;
     this.dryRun = options.dryRun ?? false;
     this.timeoutMs = options.timeoutMs;
+    this.maxResponseBytes = options.maxResponseBytes ?? 32768;
   }
 
   /**
@@ -181,6 +184,7 @@ export class CodeModeMcpServer {
           policies: this.policies,
           dryRun: this.dryRun,
           timeoutMs: this.timeoutMs,
+          maxResponseBytes: this.maxResponseBytes,
         });
         return {
           content: [
@@ -412,6 +416,7 @@ async function main() {
     policies,
     dryRun: cli.dryRun ?? process.env.DRY_RUN === "true",
     timeoutMs,
+    maxResponseBytes: policyConfig?.maxResponseBytes,
   });
   server.startStdio();
 }
