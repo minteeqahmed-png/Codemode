@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs/promises";
 import path from "node:path";
+import { postOrUpdateCodexPrComment } from "./codex-review.ts";
 
 const OWNER_LOGIN = "minteeqahmed-png";
 const AUTO_MERGE_HOURS = 24;
@@ -364,6 +365,9 @@ async function processPullRequestGovernance(
       console.log(`  [Auto-Maintain] Marked Draft PR #${pr.number} as Ready for Review.`);
     }
 
+    // Step 2: Run Codex Reviewer Audit before asking @minteeqahmed-png for Step 3 approval
+    const codexVerdict = await postOrUpdateCodexPrComment(repo, pr.number, token);
+
     const linkedIssue = findLinkedIssue(pr, pureIssues);
     const timerStartIso = linkedIssue ? linkedIssue.created_at : pr.created_at;
     const timerSourceLabel = linkedIssue ? `Issue #${linkedIssue.number}` : `PR #${pr.number}`;
@@ -479,6 +483,12 @@ Please check and approve this Pull Request (linked to **${timerSourceLabel}** cr
     const elapsedHours = (Date.now() - createdTime) / (1000 * 60 * 60);
 
     if (elapsedHours >= AUTO_MERGE_HOURS) {
+      if (codexVerdict.status === "FAILED") {
+        console.log(
+          `  [Governance] PR #${pr.number} reached 24h timer (${elapsedHours.toFixed(1)}h), but Codex Step 2 check is FAILED -> Holding auto-merge until fixed.`
+        );
+        continue;
+      }
       const mergeRes = await githubRequest(
         `https://api.github.com/repos/${repo}/pulls/${pr.number}/merge`,
         token,
