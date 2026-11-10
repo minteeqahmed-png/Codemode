@@ -3,7 +3,48 @@ import fs from "node:fs/promises";
 import readline from "node:readline";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import YAML from "yaml";
+function parseSimpleYaml(text: string): Record<string, any> {
+  const lines = text
+    .split(/\r?\n/)
+    .map((l) => l.replace(/#.*$/, ""))
+    .filter((l) => l.trim().length > 0);
+  const root: Record<string, any> = {};
+  const stack: Array<{ indent: number; container: any }> = [{ indent: -1, container: root }];
+  const parseScalar = (val: string): any => {
+    const t = val.trim();
+    if ((t.startsWith("'") && t.endsWith("'")) || (t.startsWith('"') && t.endsWith('"'))) return t.slice(1, -1);
+    if (t === "true") return true;
+    if (t === "false") return false;
+    if (t === "null") return null;
+    if (/^-?\d+(\.\d+)?$/.test(t)) return Number(t);
+    return t;
+  };
+  for (let i = 0; i < lines.length; i++) {
+    const indent = lines[i].search(/\S/);
+    const trimmed = lines[i].trim();
+    while (stack.length > 1 && indent <= stack[stack.length - 1].indent) stack.pop();
+    const parent = stack[stack.length - 1].container;
+    if (trimmed.startsWith("- ")) {
+      if (Array.isArray(parent)) parent.push(parseScalar(trimmed.slice(2)));
+      continue;
+    }
+    const colonIdx = trimmed.indexOf(":");
+    if (colonIdx !== -1) {
+      const key = String(parseScalar(trimmed.slice(0, colonIdx)));
+      const rest = trimmed.slice(colonIdx + 1).trim();
+      if (rest.length > 0) {
+        parent[key] = parseScalar(rest);
+      } else {
+        const nextTrimmed = lines[i + 1] ? lines[i + 1].trim() : "";
+        const child = nextTrimmed.startsWith("- ") ? [] : {};
+        parent[key] = child;
+        stack.push({ indent, container: child });
+      }
+    }
+  }
+  return root;
+}
+const YAML = { parse: parseSimpleYaml };
 import {
   indexOpenApiSpec,
   searchSpec,
