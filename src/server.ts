@@ -154,14 +154,14 @@ export class CodeModeMcpServer {
       {
         name: "execute",
         description:
-          "Execute JavaScript inside an isolated sandbox with access to `await api.request(method, path, body)`. Enforces audit policies automatically.",
+          "Execute JavaScript inside an isolated sandbox with access to `await api.request(method, path, body)` and `await api.paginate(method, path, options)`. Enforces audit policies automatically.",
         inputSchema: {
           type: "object",
           properties: {
             code: {
               type: "string",
               description:
-                "Async JavaScript snippet using `await api.request(method, path, body)` and returning the final filtered result.",
+                "Async JavaScript snippet using `await api.request(method, path, body)` or `await api.paginate(method, path, options)` and returning the final filtered result.",
             },
           },
           required: ["code"],

@@ -10,7 +10,7 @@ Traditional MCP servers register 1 tool per REST endpoint. For large APIs (500â€
 
 Following Cloudflare's **Code Mode** pattern, this project exposes only two MCP tools (~218 tokens total):
 1. **`search`**: Queries the OpenAPI spec on demand by keyword, tag, or HTTP method.
-2. **`execute`**: Runs a lightweight JavaScript snippet in an isolated sandbox using `await api.request(method, path, body)` while enforcing real-time security and audit policies.
+2. **`execute`**: Runs a lightweight JavaScript snippet in an isolated sandbox using `await api.request(method, path, body)` or `await api.paginate(method, path, options)` while enforcing real-time security and audit policies.
 
 ## Quick Start
 

@@ -246,7 +246,12 @@ export async function executeCodeMode(
   let requestCount = 0;
 
   const apiHelper = {
-    request: async (method: string, path: string, body?: unknown) => {
+    request: async (
+      method: string,
+      path: string,
+      body?: unknown,
+      reqOptions?: { retries?: number; retryDelayMs?: number }
+    ) => {
       requestCount++;
       for (const policy of policies) {
         const verdict = policy.check(method, path, body, { requestCount });
@@ -276,17 +281,114 @@ export async function executeCodeMode(
         url = base.toString();
       }
 
-      const response = await fetch(url, {
-        method: method.toUpperCase(),
-        headers: {
-          "Content-Type": "application/json",
-          ...(options.headers ?? {}),
-        },
-        body: body ? JSON.stringify(body) : undefined,
-      });
+      const maxRetries = reqOptions?.retries ?? 2;
+      const initialDelay = reqOptions?.retryDelayMs ?? 200;
+      let attempt = 0;
 
-      auditLog.push({ method, path, status: `${response.status}` });
-      return response.json();
+      while (true) {
+        attempt++;
+        try {
+          const response = await fetch(url, {
+            method: method.toUpperCase(),
+            headers: {
+              "Content-Type": "application/json",
+              ...(options.headers ?? {}),
+            },
+            body: body ? JSON.stringify(body) : undefined,
+          });
+
+          if ((response.status === 429 || response.status >= 500) && attempt <= maxRetries) {
+            const retryAfterHeader = response.headers.get("retry-after");
+            const delayMs = retryAfterHeader
+              ? Number(retryAfterHeader) * 1000
+              : initialDelay * Math.pow(2, attempt - 1);
+            await new Promise((resolve) => setTimeout(resolve, delayMs));
+            continue;
+          }
+
+          auditLog.push({ method, path, status: `${response.status}` });
+          return await response.json();
+        } catch (fetchErr) {
+          if (attempt <= maxRetries) {
+            const delayMs = initialDelay * Math.pow(2, attempt - 1);
+            await new Promise((resolve) => setTimeout(resolve, delayMs));
+            continue;
+          }
+          throw fetchErr;
+        }
+      }
+    },
+
+    paginate: async (
+      method: string,
+      path: string,
+      paginateOptions?: {
+        maxPages?: number;
+        limit?: number;
+        pageParam?: string;
+        limitParam?: string;
+        cursorParam?: string;
+        body?: unknown;
+      }
+    ) => {
+      const maxPages = paginateOptions?.maxPages ?? 5;
+      const limit = paginateOptions?.limit ?? 25;
+      const pageParam = paginateOptions?.pageParam ?? "page";
+      const limitParam = paginateOptions?.limitParam ?? "per_page";
+      const cursorParam = paginateOptions?.cursorParam ?? "cursor";
+
+      const allItems: unknown[] = [];
+      let currentPage = 1;
+      let nextCursor: string | undefined = undefined;
+
+      while (currentPage <= maxPages) {
+        const separator = path.includes("?") ? "&" : "?";
+        let pagedPath = `${path}${separator}${pageParam}=${currentPage}&${limitParam}=${limit}`;
+        if (nextCursor) {
+          pagedPath += `&${cursorParam}=${encodeURIComponent(nextCursor)}`;
+        }
+
+        const data = await apiHelper.request(method, pagedPath, paginateOptions?.body);
+
+        if (options.dryRun || (data && typeof data === "object" && (data as Record<string, unknown>).dryRun)) {
+          allItems.push({ page: currentPage, items: [`item_${currentPage}_1`, `item_${currentPage}_2`] });
+          currentPage++;
+          continue;
+        }
+
+        let pageItems: unknown[] = [];
+        if (Array.isArray(data)) {
+          pageItems = data;
+        } else if (data && typeof data === "object") {
+          const obj = data as Record<string, unknown>;
+          const candidate = obj.result ?? obj.items ?? obj.data ?? obj.records;
+          if (Array.isArray(candidate)) {
+            pageItems = candidate;
+          } else {
+            pageItems = [data];
+          }
+
+          const info = (obj.result_info ?? obj.pagination ?? obj.meta ?? {}) as Record<string, unknown>;
+          nextCursor = typeof info.next_cursor === "string" ? info.next_cursor : undefined;
+          if (typeof info.total_pages === "number" && currentPage >= info.total_pages) {
+            allItems.push(...pageItems);
+            break;
+          }
+        }
+
+        allItems.push(...pageItems);
+        if (pageItems.length === 0 || (pageItems.length < limit && !nextCursor)) {
+          break;
+        }
+
+        currentPage++;
+      }
+
+      return {
+        items: allItems,
+        totalItems: allItems.length,
+        pagesFetched: currentPage > maxPages ? maxPages : currentPage - 1,
+      };
     },
   };
 
