@@ -416,6 +416,30 @@ paths:
   }
   console.log(`    - [VERIFIED] Normal payload remains untruncated (truncated: false)`);
 
+  // 10. Test Built-in api.paginate() Helper
+  console.log("\n[10] TESTING BUILT-IN API.PAGINATE() SANDBOX HELPER");
+  const paginateScript = `
+    const pages = await api.paginate("GET", "/accounts/acc_123/zones/resource_0", {
+      maxPages: 3,
+      limit: 10,
+    });
+    return pages;
+  `;
+  const paginateRes = await server.handleToolCall("execute", { code: paginateScript });
+  const parsedPaginate = JSON.parse(paginateRes.content[0].text);
+  if (!parsedPaginate.result || typeof parsedPaginate.result !== "object") {
+    throw new Error(`Expected paginate result object, got: ${JSON.stringify(parsedPaginate)}`);
+  }
+  if (parsedPaginate.result.pagesFetched !== 3) {
+    throw new Error(`Expected 3 pages fetched, got ${parsedPaginate.result.pagesFetched}`);
+  }
+  if (!Array.isArray(parsedPaginate.result.items) || parsedPaginate.result.items.length !== 3) {
+    throw new Error(`Expected 3 accumulated page items, got ${parsedPaginate.result.items.length}`);
+  }
+  console.log(
+    `    - [VERIFIED] api.paginate() successfully traversed ${parsedPaginate.result.pagesFetched} pages (${parsedPaginate.result.totalItems} total items collected)`
+  );
+
   console.log("\n==================================================================");
   console.log("  ALL BENCHMARKS, POLICIES & CLI PRESETS PASSED");
   console.log("==================================================================");
