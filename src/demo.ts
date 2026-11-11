@@ -2,14 +2,14 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { CodeModeMcpServer, API_PRESETS, loadOpenApiSpec } from "./server.ts";
-import { indexOpenApiSpec, loadPolicyConfig, executeCodeMode } from "./index.ts";
+import { indexOpenApiSpec, loadPolicyConfig, executeCodeMode, type OpenApiOperation, type OpenApiSpec } from "./index.ts";
 
 /**
  * Generates a realistic multi-service Cloud Infrastructure OpenAPI v3 specification
  * (Zones, DNS, Firewall, Workers, R2, Zero Trust, Certificates, Load Balancers, WAF, Logs)
  * with 500 endpoints to benchmark Native MCP vs. Code Mode MCP.
  */
-function generateLargeCloudOpenApiSpec(totalOperations = 500): Record<string, any> {
+function generateLargeCloudOpenApiSpec(totalOperations = 500): OpenApiSpec {
   const services = [
     "zones",
     "dns_records",
@@ -23,7 +23,7 @@ function generateLargeCloudOpenApiSpec(totalOperations = 500): Record<string, an
     "waf_packages",
   ];
   const methods = ["get", "post", "put", "patch", "delete"] as const;
-  const paths: Record<string, any> = {};
+  const paths: Record<string, Record<string, OpenApiOperation>> = {};
 
   for (let i = 0; i < totalOperations / methods.length; i++) {
     const service = services[i % services.length];
@@ -293,7 +293,7 @@ paths:
 
   // 6. Test Swagger 2.0 Compatibility (schemes + host + basePath resolution)
   console.log("\n[6] TESTING SWAGGER 2.0 COMPATIBILITY (host + basePath resolution)");
-  const swagger2Spec: Record<string, any> = {
+  const swagger2Spec: OpenApiSpec = {
     swagger: "2.0",
     info: {
       title: "Petstore Swagger 2.0 API",
