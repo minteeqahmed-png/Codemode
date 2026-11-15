@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs/promises";
+import http from "node:http";
+import crypto from "node:crypto";
 import readline from "node:readline";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -147,6 +149,11 @@ export class CodeModeMcpServer {
               enum: ["GET", "POST", "PUT", "PATCH", "DELETE"],
               description: "Optional HTTP method filter",
             },
+            includeTypes: {
+              type: "boolean",
+              description:
+                "Include compact TypeScript type hints and resolved parameters/schemas (default true)",
+            },
           },
           required: ["query"],
         },
@@ -173,7 +180,10 @@ export class CodeModeMcpServer {
   public async handleToolCall(name: string, args: Record<string, unknown>) {
     if (name === "search") {
       const methodFilter = typeof args.method === "string" ? args.method : undefined;
-      const matches = searchSpec(this.endpoints, String(args.query ?? ""), methodFilter);
+      const includeTypes = typeof args.includeTypes === "boolean" ? args.includeTypes : true;
+      const matches = searchSpec(this.endpoints, String(args.query ?? ""), methodFilter, {
+        includeTypes,
+      });
       return {
         content: [
           {
@@ -227,6 +237,40 @@ export class CodeModeMcpServer {
     throw new Error(`Unknown tool: ${name}`);
   }
 
+  /**
+   * Processes a single JSON-RPC 2.0 request payload shared across stdio and HTTP/SSE transports.
+   */
+  public async handleJsonRpcMessage(msg: JsonRpcMessage): Promise<Record<string, unknown> | null> {
+    if (msg.method === "initialize") {
+      if (msg.id === undefined) return null;
+      return {
+        jsonrpc: "2.0",
+        id: msg.id,
+        result: {
+          protocolVersion: "2024-11-05",
+          capabilities: { tools: {} },
+          serverInfo: { name: "codemode", version: "0.2.0" },
+        },
+      };
+    }
+    if (msg.method === "tools/list") {
+      if (msg.id === undefined) return null;
+      return { jsonrpc: "2.0", id: msg.id, result: { tools: this.getTools() } };
+    }
+    if (msg.method === "tools/call") {
+      const res = await this.handleToolCall(
+        msg.params?.name ?? "",
+        msg.params?.arguments ?? {}
+      );
+      if (msg.id === undefined) return null;
+      return { jsonrpc: "2.0", id: msg.id, result: res };
+    }
+    if (msg.id !== undefined) {
+      return { jsonrpc: "2.0", id: msg.id, result: {} };
+    }
+    return null;
+  }
+
   public startStdio() {
     const rl = readline.createInterface({
       input: process.stdin,
@@ -239,22 +283,9 @@ export class CodeModeMcpServer {
       let msg: JsonRpcMessage | undefined;
       try {
         msg = JSON.parse(line) as JsonRpcMessage;
-        if (msg.method === "initialize") {
-          this.sendResponse(msg.id, {
-            protocolVersion: "2024-11-05",
-            capabilities: { tools: {} },
-            serverInfo: { name: "codemode", version: "0.1.0" },
-          });
-        } else if (msg.method === "tools/list") {
-          this.sendResponse(msg.id, { tools: this.getTools() });
-        } else if (msg.method === "tools/call") {
-          const res = await this.handleToolCall(
-            msg.params?.name ?? "",
-            msg.params?.arguments ?? {}
-          );
-          this.sendResponse(msg.id, res);
-        } else if (msg.id !== undefined) {
-          this.sendResponse(msg.id, {});
+        const response = await this.handleJsonRpcMessage(msg);
+        if (response) {
+          process.stdout.write(JSON.stringify(response) + "\n");
         }
       } catch (err) {
         if (msg?.id !== undefined) {
@@ -271,8 +302,148 @@ export class CodeModeMcpServer {
     });
   }
 
-  private sendResponse(id: string | number | undefined, result: unknown) {
-    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\n");
+  /**
+   * Starts a zero-dependency Streamable HTTP & Server-Sent Events (SSE) MCP server
+   * supporting `/health`, `/mcp` (POST JSON-RPC 2.0), and `/sse` + `/messages`.
+   */
+  public async startHttp(options?: { port?: number; host?: string }): Promise<{
+    server: http.Server;
+    port: number;
+    url: string;
+    close: () => Promise<void>;
+  }> {
+    const requestedPort = options?.port ?? 3000;
+    const host = options?.host ?? "127.0.0.1";
+    const sseClients = new Map<string, http.ServerResponse>();
+
+    const readJsonBody = (req: http.IncomingMessage): Promise<JsonRpcMessage> =>
+      new Promise((resolve, reject) => {
+        const chunks: Buffer[] = [];
+        let total = 0;
+        req.on("data", (chunk: Buffer) => {
+          total += chunk.length;
+          if (total > 1024 * 1024) {
+            reject(new Error("Request payload exceeded 1MB limit"));
+            req.destroy();
+            return;
+          }
+          chunks.push(chunk);
+        });
+        req.on("end", () => {
+          try {
+            const raw = Buffer.concat(chunks).toString("utf8");
+            resolve(JSON.parse(raw) as JsonRpcMessage);
+          } catch (err) {
+            reject(err);
+          }
+        });
+        req.on("error", reject);
+      });
+
+    const server = http.createServer(async (req, res) => {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
+      if (req.method === "OPTIONS") {
+        res.writeHead(204).end();
+        return;
+      }
+
+      const reqUrl = new URL(req.url ?? "/", `http://${host}`);
+
+      if (req.method === "GET" && reqUrl.pathname === "/health") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            status: "ok",
+            server: "codemode",
+            endpointsIndexed: this.endpoints.length,
+            tools: ["search", "execute"],
+          })
+        );
+        return;
+      }
+
+      if (req.method === "GET" && reqUrl.pathname === "/sse") {
+        const sessionId = crypto.randomUUID();
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+        });
+        res.write(`event: endpoint\ndata: /messages?sessionId=${sessionId}\n\n`);
+        sseClients.set(sessionId, res);
+        req.on("close", () => {
+          sseClients.delete(sessionId);
+        });
+        return;
+      }
+
+      if (req.method === "POST" && (reqUrl.pathname === "/mcp" || reqUrl.pathname === "/messages")) {
+        let msg: JsonRpcMessage | undefined;
+        try {
+          msg = await readJsonBody(req);
+          const rpcResponse = await this.handleJsonRpcMessage(msg);
+          if (reqUrl.pathname === "/messages") {
+            const sessionId = reqUrl.searchParams.get("sessionId") ?? "";
+            const stream = sseClients.get(sessionId);
+            if (!stream) {
+              res.writeHead(404, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "Unknown or closed SSE sessionId" }));
+              return;
+            }
+            if (rpcResponse) {
+              stream.write(`event: message\ndata: ${JSON.stringify(rpcResponse)}\n\n`);
+            }
+            res.writeHead(202, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ accepted: true, sessionId }));
+            return;
+          }
+
+          res.writeHead(rpcResponse ? 200 : 204, { "Content-Type": "application/json" });
+          res.end(rpcResponse ? JSON.stringify(rpcResponse) : undefined);
+          return;
+        } catch (err) {
+          const errorMessage = err instanceof Error ? err.message : String(err);
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: msg?.id ?? null,
+              error: { code: -32603, message: errorMessage },
+            })
+          );
+          return;
+        }
+      }
+
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Not found" }));
+    });
+
+    await new Promise<void>((resolve) => {
+      server.listen(requestedPort, host, () => resolve());
+    });
+
+    const address = server.address();
+    const boundPort = typeof address === "object" && address ? address.port : requestedPort;
+
+    return {
+      server,
+      port: boundPort,
+      url: `http://${host}:${boundPort}`,
+      close: async () => {
+        for (const stream of sseClients.values()) {
+          stream.end();
+        }
+        sseClients.clear();
+        server.closeAllConnections?.();
+        await new Promise<void>((resolve, reject) => {
+          server.close((err) => (err ? reject(err) : resolve()));
+        });
+      },
+    };
   }
 }
 
@@ -367,6 +538,8 @@ export function parseCliArgs(argv: string[]) {
     token?: string;
     policies?: string;
     timeoutMs?: number;
+    transport?: string;
+    port?: number;
     dryRun?: boolean;
     help?: boolean;
   } = {};
@@ -380,6 +553,10 @@ export function parseCliArgs(argv: string[]) {
     else if (arg === "--timeout-ms") {
       const val = argv[++i];
       args.timeoutMs = val !== undefined ? Number(val) : undefined;
+    } else if (arg === "--transport") args.transport = argv[++i];
+    else if (arg === "--port") {
+      const val = argv[++i];
+      args.port = val !== undefined ? Number(val) : undefined;
     }
     else if (arg === "--dry-run") args.dryRun = true;
     else if (arg === "--help" || arg === "-h") args.help = true;
@@ -391,7 +568,7 @@ async function main() {
   const cli = parseCliArgs(process.argv.slice(2));
   if (cli.help) {
     console.log(
-      `Usage: codemode [--preset <name> | --spec <url-or-file>] [--policies <policies.json>] [--timeout-ms <ms>] [--base-url <url>] [--token <api-token>] [--dry-run]`
+      `Usage: codemode [--preset <name> | --spec <url-or-file>] [--policies <policies.json>] [--timeout-ms <ms>] [--transport <stdio|http|sse>] [--port <port>] [--base-url <url>] [--token <api-token>] [--dry-run]`
     );
     console.log(`\nOptions:`);
     console.log(`  -P, --preset <name>       Preset OpenAPI spec (${Object.keys(API_PRESETS).join(", ")})`);
@@ -399,7 +576,9 @@ async function main() {
     console.log(`  -b, --base-url <url>      API base URL (overrides preset or spec default)`);
     console.log(`  -t, --token <api-token>   Bearer token for API authorization`);
     console.log(`  -p, --policies <file>     Custom policies JSON configuration path`);
-    console.log(`      --timeout-ms <ms>     Sandbox VM execution timeout in milliseconds`);
+    console.log(`      --timeout-ms <ms>     Sandbox VM & async execution timeout in milliseconds`);
+    console.log(`      --transport <mode>    MCP transport: stdio (default), http, or sse`);
+    console.log(`      --port <port>         HTTP/SSE server port (default 3000)`);
     console.log(`      --dry-run             Simulate API execution without firing live HTTP calls`);
     console.log(`  -h, --help                Show this help message`);
     return;
@@ -430,6 +609,9 @@ async function main() {
     cli.timeoutMs ??
     policyConfig?.timeoutMs ??
     (process.env.TIMEOUT_MS ? Number(process.env.TIMEOUT_MS) : undefined);
+  const transport = (cli.transport ?? process.env.MCP_TRANSPORT ?? "stdio").toLowerCase();
+  const port = cli.port ?? (process.env.PORT ? Number(process.env.PORT) : 3000);
+
   const server = new CodeModeMcpServer({
     spec,
     baseUrl,
@@ -439,7 +621,13 @@ async function main() {
     timeoutMs,
     maxResponseBytes: policyConfig?.maxResponseBytes,
   });
-  server.startStdio();
+
+  if (transport === "http" || transport === "sse") {
+    const running = await server.startHttp({ port });
+    console.log(`Codemode MCP HTTP/SSE server listening at ${running.url} (POST /mcp, GET /sse, GET /health)`);
+  } else {
+    server.startStdio();
+  }
 }
 
 const isDirectExecution =
