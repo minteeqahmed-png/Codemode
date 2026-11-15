@@ -19,8 +19,11 @@ jobs:
         with:
           node-version: "24"
 
-      - name: Install dependencies
+      - name: Install devDependencies (TypeScript types & compiler)
         run: npm install
+
+      - name: TypeScript Strict Check
+        run: npm run typecheck
 
       - name: Verify CLI Help
         run: node src/server.ts --help

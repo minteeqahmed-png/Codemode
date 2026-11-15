@@ -1,8 +1,9 @@
 import fs from "node:fs/promises";
+import http from "node:http";
 import path from "node:path";
 import os from "node:os";
-import { CodeModeMcpServer, API_PRESETS, loadOpenApiSpec } from "./server.ts";
-import { indexOpenApiSpec, loadPolicyConfig, executeCodeMode, type OpenApiOperation, type OpenApiSpec } from "./index.ts";
+import { CodeModeMcpServer, API_PRESETS, loadOpenApiSpec, parseCliArgs } from "./server.ts";
+import { indexOpenApiSpec, loadPolicyConfig, buildAuditPolicies, executeCodeMode, searchSpec, type OpenApiOperation, type OpenApiSpec } from "./index.ts";
 
 /**
  * Generates a realistic multi-service Cloud Infrastructure OpenAPI v3 specification
@@ -228,8 +229,8 @@ async function runProofOfConcept() {
   }
   console.log(`    - [VERIFIED] Configured VM execution timeout enforced (${timeoutErrText})`);
 
-  // 6. Test YAML OpenAPI Specification Loading (.yaml and .yml)
-  console.log("\n[6] TESTING YAML OPENAPI SPECIFICATION LOADING");
+  // 7. Test YAML OpenAPI Specification Loading (.yaml and .yml)
+  console.log("\n[7] TESTING YAML OPENAPI SPECIFICATION LOADING");
   const sampleYamlSpec = `
 openapi: 3.0.0
 info:
@@ -291,8 +292,8 @@ paths:
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
 
-  // 6. Test Swagger 2.0 Compatibility (schemes + host + basePath resolution)
-  console.log("\n[6] TESTING SWAGGER 2.0 COMPATIBILITY (host + basePath resolution)");
+  // 8. Test Swagger 2.0 Compatibility (schemes + host + basePath resolution)
+  console.log("\n[8] TESTING SWAGGER 2.0 COMPATIBILITY (host + basePath resolution)");
   const swagger2Spec: OpenApiSpec = {
     swagger: "2.0",
     info: {
@@ -439,6 +440,379 @@ paths:
   console.log(
     `    - [VERIFIED] api.paginate() successfully traversed ${parsedPaginate.result.pagesFetched} pages (${parsedPaginate.result.totalItems} total items collected)`
   );
+
+  // 11. Test OpenAPI $ref + Circular $ref Schema Resolution, TypeScript typeHints & Relevance Search
+  console.log("\n[11] TESTING OPENAPI $REF RESOLUTION, TS TYPE HINTS & RELEVANCE SEARCH");
+  const refSpec: OpenApiSpec = {
+    openapi: "3.0.3",
+    info: { title: "Ref Test API", version: "1.0.0" },
+    components: {
+      schemas: {
+        CreateItemInput: {
+          type: "object",
+          required: ["name"],
+          properties: {
+            name: { type: "string" },
+            tags: { type: "array", items: { type: "string" } },
+            parent: { $ref: "#/components/schemas/Node" },
+          },
+        },
+        Node: {
+          type: "object",
+          required: ["id"],
+          properties: {
+            id: { type: "string" },
+            next: { $ref: "#/components/schemas/Node" },
+          },
+        },
+      },
+    },
+    paths: {
+      "/items": {
+        get: {
+          operationId: "listItems",
+          summary: "List items",
+          responses: {
+            "200": {
+              description: "OK",
+              content: {
+                "application/json": {
+                  schema: { type: "array", items: { $ref: "#/components/schemas/Node" } },
+                },
+              },
+            },
+          },
+        },
+        post: {
+          operationId: "createItem",
+          summary: "Create item",
+          parameters: [{ name: "dryRun", in: "query", required: false, schema: { type: "boolean" } }],
+          requestBody: {
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/CreateItemInput" },
+              },
+            },
+          },
+          responses: {
+            "201": {
+              description: "Created",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/Node" },
+                },
+              },
+            },
+          },
+        },
+      },
+      "/status": {
+        get: {
+          operationId: "getStatus",
+          summary: "Inspect items subsystem health",
+          responses: { "200": { description: "OK" } },
+        },
+      },
+    },
+  };
+
+  const refEndpoints = indexOpenApiSpec(refSpec);
+  const postItemResults = searchSpec(refEndpoints, "items", "POST");
+  if (postItemResults.length !== 1) {
+    throw new Error(`Expected 1 POST /items endpoint, got ${postItemResults.length}`);
+  }
+  const hints = postItemResults[0].typeHints;
+  if (
+    !hints?.parameters?.includes("dryRun?: boolean") ||
+    !hints?.requestBody?.includes("name: string") ||
+    !hints?.requestBody?.includes("tags?: string[]") ||
+    !hints?.response?.includes("next?: Node")
+  ) {
+    throw new Error(`Unexpected resolved typeHints: ${JSON.stringify(hints)}`);
+  }
+  const rankedItems = searchSpec(refEndpoints, "items");
+  if (rankedItems.length < 3 || rankedItems[0].path !== "/items") {
+    throw new Error(`Expected /items to outrank summary-only match, got ${rankedItems[0]?.path}`);
+  }
+  const slimSearch = searchSpec(refEndpoints, "items", "POST", { includeTypes: false });
+  if (slimSearch.length !== 1 || slimSearch[0].typeHints !== undefined) {
+    throw new Error("Expected includeTypes: false to omit typeHints");
+  }
+  console.log("    - [VERIFIED] $ref & circular $ref resolution produced compact TS typeHints and ranked search results");
+
+  // 12. Test Security Hardening, Async Abort Timeout, 204/503 Retry & Cursor Pagination Edge Cases
+  console.log("\n[12] TESTING SECURITY HARDENING, ASYNC ABORT TIMEOUT, 204/RETRY & CURSOR PAGINATION");
+  const auditPolicies = buildAuditPolicies();
+  const hardeningDryRun = await executeCodeMode(
+    `
+      const verdicts = {};
+      try {
+        await api.request("POST", "/IAM/users", { name: "alice" });
+      } catch (err) {
+        verdicts.iamBlocked = String(err && err.message ? err.message : err);
+      }
+      try {
+        await api.request("POST", "/webhooks", {
+          safe: "http://localhost:8080",
+          evil: "http://attacker.example/hook"
+        });
+      } catch (err) {
+        verdicts.httpBlocked = String(err && err.message ? err.message : err);
+      }
+      verdicts.allowed = await api.request("GET", "/zones");
+      return verdicts;
+    `,
+    {
+      baseUrl: "https://example.invalid",
+      policies: auditPolicies,
+      dryRun: true,
+    }
+  );
+  const hardeningResult = hardeningDryRun.result as Record<string, unknown>;
+  if (
+    typeof hardeningResult.iamBlocked !== "string" ||
+    !hardeningResult.iamBlocked.includes("protect-sensitive-account-paths")
+  ) {
+    throw new Error(`Expected case-insensitive /IAM block, got: ${JSON.stringify(hardeningResult)}`);
+  }
+  if (
+    typeof hardeningResult.httpBlocked !== "string" ||
+    !hardeningResult.httpBlocked.includes("block-insecure-http-origins")
+  ) {
+    throw new Error(`Expected http:// smuggling block, got: ${JSON.stringify(hardeningResult)}`);
+  }
+  if (
+    hardeningDryRun.dryRunSummary?.totalCalls !== 3 ||
+    hardeningDryRun.dryRunSummary?.allowedCalls !== 1 ||
+    hardeningDryRun.dryRunSummary?.blockedCalls !== 2
+  ) {
+    throw new Error(`Unexpected dryRunSummary: ${JSON.stringify(hardeningDryRun.dryRunSummary)}`);
+  }
+  console.log("    - [VERIFIED] Case-insensitive protected path check, HTTP smuggling fix, and dryRunSummary counters");
+
+  let flakyAttempts = 0;
+  const pendingTimers = new Set<ReturnType<typeof setTimeout>>();
+  const edgeServer = http.createServer((req, res) => {
+    const reqUrl = new URL(req.url ?? "/", "http://127.0.0.1");
+    if (reqUrl.pathname === "/slow") {
+      const timer = setTimeout(() => {
+        pendingTimers.delete(timer);
+        if (!res.writableEnded) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ slow: true }));
+        }
+      }, 400);
+      pendingTimers.add(timer);
+      req.on("close", () => {
+        clearTimeout(timer);
+        pendingTimers.delete(timer);
+      });
+      return;
+    }
+    if (reqUrl.pathname === "/empty") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    if (reqUrl.pathname === "/flaky") {
+      flakyAttempts++;
+      if (flakyAttempts === 1) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "temporary overload" }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ recovered: true, attempt: flakyAttempts }));
+      return;
+    }
+    if (reqUrl.pathname === "/cursor-pages") {
+      const cursor = reqUrl.searchParams.get("cursor");
+      if (!cursor) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ result: [{ id: 1 }, { id: 2 }], result_info: { next_cursor: "c2" } }));
+      } else {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ result: [{ id: 3 }], result_info: {} }));
+      }
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+
+  await new Promise<void>((resolve) => edgeServer.listen(0, "127.0.0.1", () => resolve()));
+  const edgeAddr = edgeServer.address();
+  const edgePort = typeof edgeAddr === "object" && edgeAddr ? edgeAddr.port : 0;
+  const edgeBaseUrl = `http://127.0.0.1:${edgePort}`;
+
+  try {
+    let timedOut = false;
+    try {
+      await executeCodeMode(`return await api.request("GET", "/slow");`, {
+        baseUrl: edgeBaseUrl,
+        policies: auditPolicies,
+        timeoutMs: 60,
+      });
+    } catch (timeoutErr) {
+      const msg = timeoutErr instanceof Error ? timeoutErr.message : String(timeoutErr);
+      if (msg.includes("timed out after 60ms")) {
+        timedOut = true;
+      } else {
+        throw timeoutErr;
+      }
+    }
+    if (!timedOut) {
+      throw new Error("Expected async slow fetch to abort and time out after 60ms");
+    }
+
+    const edgeExec = await executeCodeMode(
+      `
+        const emptyRes = await api.request("POST", "/empty", { ping: true });
+        const flakyRes = await api.request("GET", "/flaky", undefined, { retries: 2, retryDelayMs: 15 });
+        const onePage = await api.paginate("GET", "/cursor-pages", { limit: 2, maxPages: 1 });
+        const allPages = await api.paginate("GET", "/cursor-pages", { limit: 2, maxPages: 5 });
+        return { emptyRes, flakyRes, onePage, allPages };
+      `,
+      {
+        baseUrl: edgeBaseUrl,
+        policies: auditPolicies,
+        timeoutMs: 3000,
+      }
+    );
+    const edgeData = edgeExec.result as {
+      emptyRes: unknown;
+      flakyRes: { recovered: boolean; attempt: number };
+      onePage: { pagesFetched: number; totalItems: number };
+      allPages: { pagesFetched: number; totalItems: number };
+    };
+    if (edgeData.emptyRes !== null) {
+      throw new Error(`Expected 204 No Content to return null, got: ${JSON.stringify(edgeData.emptyRes)}`);
+    }
+    if (!edgeData.flakyRes?.recovered || edgeData.flakyRes.attempt !== 2) {
+      throw new Error(`Expected 503 auto-retry to succeed on attempt 2, got: ${JSON.stringify(edgeData.flakyRes)}`);
+    }
+    if (edgeData.onePage.pagesFetched !== 1 || edgeData.onePage.totalItems !== 2) {
+      throw new Error(`Expected 1 page / 2 items for maxPages=1, got: ${JSON.stringify(edgeData.onePage)}`);
+    }
+    if (edgeData.allPages.pagesFetched !== 2 || edgeData.allPages.totalItems !== 3) {
+      throw new Error(`Expected 2 pages / 3 items across cursor pagination, got: ${JSON.stringify(edgeData.allPages)}`);
+    }
+    console.log("    - [VERIFIED] Async AbortController timeout, 204 null body, 503 auto-retry, and exact cursor pagesFetched");
+  } finally {
+    for (const timer of pendingTimers) {
+      clearTimeout(timer);
+    }
+    pendingTimers.clear();
+    edgeServer.closeAllConnections?.();
+    await new Promise<void>((resolve) => edgeServer.close(() => resolve()));
+  }
+
+  // 13. Test CLI Flags & Zero-Dependency HTTP + SSE MCP Transport
+  console.log("\n[13] TESTING CLI FLAGS & HTTP / SSE MCP TRANSPORT");
+  const parsedFlags = parseCliArgs(["--transport", "sse", "--port", "4010", "--timeout-ms", "2500", "--dry-run"]);
+  if (
+    parsedFlags.transport !== "sse" ||
+    parsedFlags.port !== 4010 ||
+    parsedFlags.timeoutMs !== 2500 ||
+    parsedFlags.dryRun !== true
+  ) {
+    throw new Error(`Unexpected parseCliArgs output: ${JSON.stringify(parsedFlags)}`);
+  }
+
+  const httpMcpServer = new CodeModeMcpServer({
+    spec: refSpec,
+    baseUrl: "https://example.invalid",
+    dryRun: true,
+    policies: auditPolicies,
+  });
+  const startedHttp = await httpMcpServer.startHttp({ port: 0, host: "127.0.0.1" });
+  try {
+    const healthRes = await fetch(`${startedHttp.url}/health`);
+    const healthJson = (await healthRes.json()) as {
+      status: string;
+      endpointsIndexed: number;
+      tools: string[];
+    };
+    if (
+      healthRes.status !== 200 ||
+      healthJson.status !== "ok" ||
+      healthJson.endpointsIndexed !== 3 ||
+      healthJson.tools.length !== 2
+    ) {
+      throw new Error(`Unexpected /health response: ${JSON.stringify(healthJson)}`);
+    }
+
+    const mcpCallRes = await fetch(`${startedHttp.url}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: "search", arguments: { query: "items", method: "POST" } },
+      }),
+    });
+    const mcpCallJson = (await mcpCallRes.json()) as {
+      result?: { content?: Array<{ text: string }> };
+    };
+    const searchPayload = JSON.parse(mcpCallJson.result?.content?.[0]?.text ?? "{}") as {
+      matchCount: number;
+      endpoints: Array<{ typeHints?: { requestBody?: string } }>;
+    };
+    if (
+      mcpCallRes.status !== 200 ||
+      searchPayload.matchCount !== 1 ||
+      !searchPayload.endpoints[0]?.typeHints?.requestBody?.includes("name: string")
+    ) {
+      throw new Error(`Unexpected POST /mcp search response: ${JSON.stringify(mcpCallJson)}`);
+    }
+
+    const sseAbort = new AbortController();
+    const sseRes = await fetch(`${startedHttp.url}/sse`, { signal: sseAbort.signal });
+    const reader = sseRes.body?.getReader();
+    if (!sseRes.ok || !reader) {
+      throw new Error(`Failed to open GET /sse stream: status ${sseRes.status}`);
+    }
+    const decoder = new TextDecoder();
+    let sseBuffer = "";
+    const readUntil = async (marker: string) => {
+      const startedWait = Date.now();
+      while (!sseBuffer.includes(marker)) {
+        if (Date.now() - startedWait > 3000) {
+          throw new Error(`Timed out waiting for SSE marker '${marker}' in buffer: ${sseBuffer}`);
+        }
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        sseBuffer += decoder.decode(chunk.value, { stream: true });
+      }
+    };
+
+    try {
+      await readUntil("event: endpoint\n");
+      const endpointMatch = sseBuffer.match(/data:\s*(\/messages\?sessionId=[^\s]+)/);
+      if (!endpointMatch) {
+        throw new Error(`Missing SSE endpoint session path in: ${sseBuffer}`);
+      }
+      const msgRes = await fetch(`${startedHttp.url}${endpointMatch[1]}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 9, method: "tools/list" }),
+      });
+      if (msgRes.status !== 202) {
+        throw new Error(`Expected 202 Accepted from POST /messages, got ${msgRes.status}`);
+      }
+      await readUntil('"id":9');
+      if (!sseBuffer.includes('"search"') || !sseBuffer.includes('"execute"')) {
+        throw new Error(`Expected tools/list response on SSE stream, got: ${sseBuffer}`);
+      }
+    } finally {
+      await reader.cancel().catch(() => {});
+      sseAbort.abort();
+    }
+    console.log("    - [VERIFIED] CLI flags, GET /health, POST /mcp, and GET /sse + POST /messages round-trip");
+  } finally {
+    await startedHttp.close();
+  }
 
   console.log("\n==================================================================");
   console.log("  ALL BENCHMARKS, POLICIES & CLI PRESETS PASSED");

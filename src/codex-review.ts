@@ -51,16 +51,14 @@ export async function runCodexReview(
 
   // Check 2: MCP 2-Tool Surface Constraint (`search` + `execute` only)
   if (changedFiles.some((f) => f.includes("server.ts") || f.includes("index.ts"))) {
-    const toolNameMatches = [...addedLines.matchAll(/name:\s*["']([a-zA-Z0-9_-]+)["']/g)];
-    const invalidTools = toolNameMatches
+    // Match actual tool definition objects (`name: "<tool>"` paired closely with `inputSchema`)
+    const toolDefMatches = [
+      ...addedLines.matchAll(/name:\s*["']([a-zA-Z0-9_-]+)["'][\s\S]{0,250}?inputSchema\s*:/g),
+    ];
+    const invalidTools = toolDefMatches
       .map((m) => m[1])
-      .filter(
-        (name) =>
-          !["search", "execute", "codemode", "openapi-codemode-mcp", "account_id", "page", "per_page", "block-bad-actors"].includes(
-            name
-          )
-      );
-    if (invalidTools.length > 0 && changedFiles.includes("src/server.ts") && addedLines.includes("inputSchema")) {
+      .filter((name) => name !== "search" && name !== "execute");
+    if (invalidTools.length > 0 && changedFiles.includes("src/server.ts")) {
       checks.push({
         name: "MCP 2-Tool Surface Limit",
         passed: false,
@@ -112,9 +110,18 @@ export async function runCodexReview(
   }
 
   // Check 5: Zero-Dependency Runtime Footprint
-  const modifiesRuntimeDeps =
-    changedFiles.includes("package.json") && /"dependencies"\s*:\s*\{/.test(addedLines);
-  if (modifiesRuntimeDeps) {
+  const clearedDeps =
+    changedFiles.includes("package.json") && /"dependencies"\s*:\s*\{\s*\}/.test(addedLines);
+  const addsNonEmptyRuntimeDeps =
+    changedFiles.includes("package.json") &&
+    /"dependencies"\s*:\s*\{[^}]*["'][^"']+["']\s*:/.test(addedLines);
+  if (clearedDeps) {
+    checks.push({
+      name: "Zero-Bloat Dependency Check",
+      passed: true,
+      message: "Cleaned package.json to zero external runtime dependencies (Node.js 24 built-ins only).",
+    });
+  } else if (addsNonEmptyRuntimeDeps) {
     checks.push({
       name: "Zero-Bloat Dependency Check",
       passed: true,

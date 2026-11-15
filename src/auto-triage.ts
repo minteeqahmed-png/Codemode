@@ -103,13 +103,64 @@ While OpenAPI 3.x uses \`spec.servers[0].url\`, many legacy enterprise APIs use 
 Continuous documentation maintenance check detected CLI flags in \`src/server.ts\` that are not yet documented in \`README.md\`.
 
 ## Acceptance Criteria
-1. Document all supported CLI flags (\`--spec\`, \`--preset\`, \`--policies\`, \`--base-url\`, \`--token\`, \`--dry-run\`) in \`README.md\`.
+1. Document all supported CLI flags (\`--spec\`, \`--preset\`, \`--policies\`, \`--timeout-ms\`, \`--transport\`, \`--port\`, \`--base-url\`, \`--token\`, \`--dry-run\`) in \`README.md\`.
 2. Ensure \`npm run demo\` passes.`,
     isImplemented: (files) => {
       const serverCode = files["src/server.ts"] ?? "";
       const readme = files["README.md"] ?? "";
-      const flags = ["--spec", "--policies", "--base-url", "--dry-run"];
+      const flags = [
+        "--spec",
+        "--policies",
+        "--timeout-ms",
+        "--transport",
+        "--port",
+        "--base-url",
+        "--dry-run",
+      ];
       return flags.every((f) => !serverCode.includes(f) || readme.includes(f));
+    },
+  },
+  {
+    key: "openapi-ref-ts-type-introspection",
+    title: "feat: resolve OpenAPI $ref schemas and emit TypeScript typeHints in search",
+    body: `## Summary
+Enterprise specs rely heavily on JSON Pointer \`$ref\` schemas and response definitions. Resolve internal \`$ref\` schemas safely and surface compact TypeScript \`typeHints\` in \`searchSpec\`.`,
+    isImplemented: (files) =>
+      (files["src/index.ts"] ?? "").includes("schemaToTsType") &&
+      (files["src/index.ts"] ?? "").includes("resolveSchemaNode"),
+  },
+  {
+    key: "async-vm-timeout-abort",
+    title: "fix: enforce async wall-clock timeout via AbortController in executeCodeMode",
+    body: `## Summary
+Node \`vm.runInContext\` only enforces synchronous CPU execution timeouts. Wrap async script promises and outbound \`fetch\` calls with \`AbortController\` + \`Promise.race\`.`,
+    isImplemented: (files) =>
+      (files["src/index.ts"] ?? "").includes("AbortController") &&
+      (files["src/index.ts"] ?? "").includes("Promise.race"),
+  },
+  {
+    key: "http-sse-transport",
+    title: "feat: support Streamable HTTP and SSE MCP transport in CodeModeMcpServer",
+    body: `## Summary
+Support zero-dependency \`http\` / \`sse\` MCP transport (\`POST /mcp\`, \`GET /sse\`, \`GET /health\`) via \`node:http\` for remote agents and web IDEs.`,
+    isImplemented: (files) =>
+      (files["src/server.ts"] ?? "").includes("startHttp") &&
+      (files["src/server.ts"] ?? "").includes("/sse"),
+  },
+  {
+    key: "zero-runtime-dependencies",
+    title: "chore: remove unused runtime dependencies from package.json for instant Node 24 execution",
+    body: `## Summary
+Source code uses Node.js 24 built-in standard modules exclusively; keep \`package.json\` runtime \`dependencies\` empty.`,
+    isImplemented: (files) => {
+      try {
+        const pkg = JSON.parse(files["package.json"] ?? "{}") as {
+          dependencies?: Record<string, string>;
+        };
+        return Object.keys(pkg.dependencies ?? {}).length === 0;
+      } catch {
+        return true;
+      }
     },
   },
 ];
