@@ -486,7 +486,7 @@ paths:
         post: {
           operationId: "createItem",
           summary: "Create item",
-          parameters: [{ name: "dryRun", in: "query", required: false, schema: { type: "boolean" } }],
+          parameters: [{ name: "page", in: "query", required: false, schema: { type: "number" } }],
           requestBody: {
             content: {
               "application/json": {
@@ -523,7 +523,7 @@ paths:
   }
   const hints = postItemResults[0].typeHints;
   if (
-    !hints?.parameters?.includes("dryRun?: boolean") ||
+    !hints?.parameters?.includes("page?: number") ||
     !hints?.requestBody?.includes("name: string") ||
     !hints?.requestBody?.includes("tags?: string[]") ||
     !hints?.response?.includes("next?: Node")
@@ -547,7 +547,7 @@ paths:
     `
       const verdicts = {};
       try {
-        await api.request("POST", "/IAM/users", { name: "alice" });
+        await api.request("POST", "/IAM/users", { role: "admin" });
       } catch (err) {
         verdicts.iamBlocked = String(err && err.message ? err.message : err);
       }
