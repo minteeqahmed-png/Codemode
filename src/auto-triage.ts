@@ -163,6 +163,16 @@ Source code uses Node.js 24 built-in standard modules exclusively; keep \`packag
       }
     },
   },
+  {
+    key: "ssrf-origin-guard-and-yaml-ref-hardening",
+    title: "fix: enforce same-origin SSRF guard, URL-decoded path normalization, and YAML $ref parsing",
+    body: `## Summary
+Enforce same-origin isolation in \`executeCodeMode\`, decode/normalize paths in \`protect-sensitive-account-paths\`, and preserve \`$ref\` fragments in \`parseSimpleYaml\`.`,
+    isImplemented: (files) =>
+      (files["src/index.ts"] ?? "").includes("normalizeApiPath") &&
+      (files["src/index.ts"] ?? "").includes("Blocked cross-origin request") &&
+      (files["src/server.ts"] ?? "").includes("stripYamlComment"),
+  },
 ];
 
 /**
