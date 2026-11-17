@@ -27,8 +27,8 @@
     "codemode": "./dist/server.js"
   },
   "scripts": {
-    "build": "tsc",
-    "typecheck": "tsc --noEmit",
+    "build": "node ./node_modules/typescript/bin/tsc",
+    "typecheck": "node ./node_modules/typescript/bin/tsc --noEmit",
     "start": "node src/server.ts",
     "demo": "node src/demo.ts",
     "review": "node src/codex-review.ts",

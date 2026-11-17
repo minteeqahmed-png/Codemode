@@ -5,10 +5,24 @@ import crypto from "node:crypto";
 import readline from "node:readline";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+function stripYamlComment(line: string): string {
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === "'" && !inDouble) inSingle = !inSingle;
+    else if (ch === '"' && !inSingle && line[i - 1] !== "\\") inDouble = !inDouble;
+    else if (ch === "#" && !inSingle && !inDouble && (i === 0 || /\s/.test(line[i - 1]))) {
+      return line.slice(0, i);
+    }
+  }
+  return line;
+}
+
 function parseSimpleYaml(text: string): OpenApiSpec {
   const lines = text
     .split(/\r?\n/)
-    .map((l) => l.replace(/#.*$/, ""))
+    .map((l) => stripYamlComment(l))
     .filter((l) => l.trim().length > 0);
   const root: Record<string, unknown> = {};
   const stack: Array<{ indent: number; container: Record<string, unknown> | unknown[] }> = [
@@ -28,8 +42,40 @@ function parseSimpleYaml(text: string): OpenApiSpec {
     const trimmed = lines[i].trim();
     while (stack.length > 1 && indent <= stack[stack.length - 1].indent) stack.pop();
     const parent = stack[stack.length - 1].container;
-    if (trimmed.startsWith("- ")) {
-      if (Array.isArray(parent)) parent.push(parseScalar(trimmed.slice(2)));
+    if (trimmed.startsWith("- ") || trimmed === "-") {
+      if (Array.isArray(parent)) {
+        const afterDash = trimmed === "-" ? "" : trimmed.slice(2).trim();
+        if (!afterDash) {
+          const itemObj: Record<string, unknown> = {};
+          parent.push(itemObj);
+          stack.push({ indent, container: itemObj });
+          continue;
+        }
+        const itemColonIdx = afterDash.indexOf(":");
+        const isQuotedScalar =
+          (afterDash.startsWith("'") && afterDash.endsWith("'")) ||
+          (afterDash.startsWith('"') && afterDash.endsWith('"'));
+        if (itemColonIdx !== -1 && !isQuotedScalar) {
+          const itemObj: Record<string, unknown> = {};
+          const itemKey = String(parseScalar(afterDash.slice(0, itemColonIdx)));
+          const itemRest = afterDash.slice(itemColonIdx + 1).trim();
+          if (itemRest.length > 0) {
+            itemObj[itemKey] = parseScalar(itemRest);
+          } else {
+            const nextTrimmed = lines[i + 1] ? lines[i + 1].trim() : "";
+            const nested: Record<string, unknown> | unknown[] = nextTrimmed.startsWith("-") ? [] : {};
+            itemObj[itemKey] = nested;
+            parent.push(itemObj);
+            stack.push({ indent, container: itemObj });
+            stack.push({ indent: indent + 2, container: nested });
+            continue;
+          }
+          parent.push(itemObj);
+          stack.push({ indent, container: itemObj });
+          continue;
+        }
+        parent.push(parseScalar(afterDash));
+      }
       continue;
     }
     const colonIdx = trimmed.indexOf(":");
@@ -40,7 +86,7 @@ function parseSimpleYaml(text: string): OpenApiSpec {
         parent[key] = parseScalar(rest);
       } else {
         const nextTrimmed = lines[i + 1] ? lines[i + 1].trim() : "";
-        const child: Record<string, unknown> | unknown[] = nextTrimmed.startsWith("- ") ? [] : {};
+        const child: Record<string, unknown> | unknown[] = nextTrimmed.startsWith("-") ? [] : {};
         parent[key] = child;
         stack.push({ indent, container: child });
       }
@@ -110,7 +156,20 @@ export class CodeModeMcpServer {
    */
   private resolveBaseUrl(spec: OpenApiSpec, explicitBaseUrl?: string): string {
     if (explicitBaseUrl) return explicitBaseUrl;
-    if (spec?.servers?.[0]?.url) return spec.servers[0].url;
+    if (spec?.servers?.[0]?.url) {
+      let serverUrl = spec.servers[0].url;
+      const variables = spec.servers[0].variables;
+      if (variables && typeof variables === "object") {
+        serverUrl = serverUrl.replace(/\{([^}]+)\}/g, (_match, varName: string) => {
+          const varDef = variables[varName];
+          return typeof varDef?.default === "string" ? varDef.default : `{${varName}}`;
+        });
+      }
+      if (serverUrl.startsWith("http://") || serverUrl.startsWith("https://")) {
+        return serverUrl.replace(/\/+$/, "");
+      }
+      return serverUrl;
+    }
 
     // Swagger 2.0 resolution: schemes + host + basePath
     if (spec?.host) {
@@ -265,10 +324,21 @@ export class CodeModeMcpServer {
       if (msg.id === undefined) return null;
       return { jsonrpc: "2.0", id: msg.id, result: res };
     }
-    if (msg.id !== undefined) {
+    if (msg.method === "ping") {
+      if (msg.id === undefined) return null;
       return { jsonrpc: "2.0", id: msg.id, result: {} };
     }
-    return null;
+    if (msg.id === undefined) {
+      return null;
+    }
+    return {
+      jsonrpc: "2.0",
+      id: msg.id,
+      error: {
+        code: -32601,
+        message: `Method not found: ${String(msg.method ?? "unknown")}`,
+      },
+    };
   }
 
   public startStdio() {
@@ -320,24 +390,33 @@ export class CodeModeMcpServer {
       new Promise((resolve, reject) => {
         const chunks: Buffer[] = [];
         let total = 0;
+        let settled = false;
+        const fail = (err: unknown) => {
+          if (settled) return;
+          settled = true;
+          reject(err);
+        };
         req.on("data", (chunk: Buffer) => {
+          if (settled) return;
           total += chunk.length;
           if (total > 1024 * 1024) {
-            reject(new Error("Request payload exceeded 1MB limit"));
+            fail(new Error("Request payload exceeded 1MB limit"));
             req.destroy();
             return;
           }
           chunks.push(chunk);
         });
         req.on("end", () => {
+          if (settled) return;
           try {
             const raw = Buffer.concat(chunks).toString("utf8");
+            settled = true;
             resolve(JSON.parse(raw) as JsonRpcMessage);
           } catch (err) {
-            reject(err);
+            fail(err);
           }
         });
-        req.on("error", reject);
+        req.on("error", fail);
       });
 
     const server = http.createServer(async (req, res) => {
@@ -406,7 +485,8 @@ export class CodeModeMcpServer {
           return;
         } catch (err) {
           const errorMessage = err instanceof Error ? err.message : String(err);
-          res.writeHead(400, { "Content-Type": "application/json" });
+          const isTooLarge = errorMessage.includes("exceeded 1MB limit");
+          res.writeHead(isTooLarge ? 413 : 400, { "Content-Type": "application/json" });
           res.end(
             JSON.stringify({
               jsonrpc: "2.0",

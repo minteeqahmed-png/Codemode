@@ -1,5 +1,6 @@
 import vm from "node:vm";
 import fs from "node:fs/promises";
+import path from "node:path";
 
 export interface OpenApiOperation {
   operationId?: string;
@@ -15,6 +16,10 @@ export interface OpenApiOperation {
 export interface OpenApiServer {
   url: string;
   description?: string;
+  variables?: Record<
+    string,
+    { default?: string; enum?: string[]; description?: string; [key: string]: unknown }
+  >;
   [key: string]: unknown;
 }
 
@@ -91,6 +96,31 @@ export interface PolicyConfigFile {
 }
 
 /**
+ * Safely URL-decodes and normalizes an API request path (collapsing `/./` and `/../` dot segments)
+ * so encoded or traversal paths cannot bypass `protect-sensitive-account-paths`.
+ */
+export function normalizeApiPath(rawPath: string): string {
+  let pathname = rawPath.trim();
+  if (pathname.startsWith("http://") || pathname.startsWith("https://")) {
+    try {
+      pathname = new URL(pathname).pathname;
+    } catch {
+      pathname = pathname.split("?")[0] ?? pathname;
+    }
+  } else {
+    pathname = pathname.split("?")[0] ?? pathname;
+  }
+  let decoded = pathname;
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch {
+    decoded = pathname;
+  }
+  const ensuredLeadingSlash = decoded.startsWith("/") ? decoded : `/${decoded}`;
+  return path.posix.normalize(ensuredLeadingSlash);
+}
+
+/**
  * Builds the full suite of security & infrastructure audit policies,
  * optionally merging user overrides from a JSON policy config.
  */
@@ -147,14 +177,16 @@ export function buildAuditPolicies(config?: PolicyConfigFile): PolicyRule[] {
     {
       id: "protect-sensitive-account-paths",
       description: `Prevent modifications to sensitive paths (${protectedPrefixes.join(", ")})`,
-      check: (method, path) => {
+      check: (method, requestPath) => {
         if (method.toUpperCase() !== "GET") {
-          const normalizedPath = path.toLowerCase();
+          const rawNormalized = requestPath.toLowerCase();
+          const canonicalPath = normalizeApiPath(requestPath).toLowerCase();
           for (const prefix of protectedPrefixes) {
-            if (normalizedPath.includes(prefix.toLowerCase())) {
+            const lowerPrefix = prefix.toLowerCase();
+            if (rawNormalized.includes(lowerPrefix) || canonicalPath.includes(lowerPrefix)) {
               return {
                 allowed: false,
-                reason: `Blocked write operation on protected path '${prefix}' (${path}) by policy 'protect-sensitive-account-paths'.`,
+                reason: `Blocked write operation on protected path '${prefix}' (${requestPath}) by policy 'protect-sensitive-account-paths'.`,
               };
             }
           }
@@ -165,7 +197,20 @@ export function buildAuditPolicies(config?: PolicyConfigFile): PolicyRule[] {
     {
       id: "block-insecure-http-origins",
       description: "Prevent configuring unencrypted http:// webhooks or origin servers",
-      check: (method, _path, body) => {
+      check: (method, requestPath, body) => {
+        if (blockHttp) {
+          const trimmedLower = requestPath.trim().toLowerCase();
+          if (
+            trimmedLower.startsWith("http://") &&
+            !trimmedLower.startsWith("http://localhost") &&
+            !trimmedLower.startsWith("http://127.0.0.1")
+          ) {
+            return {
+              allowed: false,
+              reason: "Blocked unencrypted 'http://' origin/webhook target by policy 'block-insecure-http-origins'.",
+            };
+          }
+        }
         if (blockHttp && method.toUpperCase() !== "GET" && body) {
           const serialized = JSON.stringify(body);
           // Match every http:// URL independently so localhost in one field cannot mask an insecure target in another.
@@ -416,12 +461,31 @@ export function indexOpenApiSpec(spec: OpenApiSpec): OpenApiEndpoint[] {
 
   for (const [pathKey, methods] of Object.entries(paths)) {
     if (!methods || typeof methods !== "object") continue;
+    const rawPathParams = Array.isArray((methods as Record<string, unknown>).parameters)
+      ? ((methods as Record<string, unknown>).parameters as unknown[])
+      : [];
     for (const [httpMethod, details] of Object.entries(methods)) {
       if (["get", "post", "put", "patch", "delete"].includes(httpMethod.toLowerCase())) {
         const op = (details && typeof details === "object" ? details : {}) as OpenApiOperation;
-        const resolvedParams = Array.isArray(op.parameters)
-          ? (op.parameters.map((p) => resolveSchemaNode(spec, p)) as unknown[])
-          : undefined;
+        const rawOpParams = Array.isArray(op.parameters) ? op.parameters : [];
+        const mergedParamList: unknown[] = [];
+        const paramIndexByKey = new Map<string, number>();
+        for (const rawParam of [...rawPathParams, ...rawOpParams]) {
+          const resolvedParam = resolveSchemaNode(spec, rawParam);
+          if (resolvedParam && typeof resolvedParam === "object") {
+            const pObj = resolvedParam as Record<string, unknown>;
+            const key = `${String(pObj.name ?? "")}:${String(pObj.in ?? "")}`;
+            if (key !== ":" && paramIndexByKey.has(key)) {
+              mergedParamList[paramIndexByKey.get(key)!] = resolvedParam;
+              continue;
+            }
+            if (key !== ":") {
+              paramIndexByKey.set(key, mergedParamList.length);
+            }
+          }
+          mergedParamList.push(resolvedParam);
+        }
+        const resolvedParams = mergedParamList.length > 0 ? mergedParamList : undefined;
         const resolvedReqBody = extractRequestBodySchema(spec, op);
         const resolvedResponse = extractSuccessResponseSchema(spec, op);
         const typeHints = buildEndpointTypeHints(
@@ -547,6 +611,7 @@ export async function executeCodeMode(
     dryRun?: boolean;
     timeoutMs?: number;
     maxResponseBytes?: number;
+    allowCrossOrigin?: boolean;
   }
 ) {
   const startedAt = Date.now();
@@ -560,18 +625,18 @@ export async function executeCodeMode(
   const apiHelper = {
     request: async (
       method: string,
-      path: string,
+      requestPath: string,
       body?: unknown,
       reqOptions?: { retries?: number; retryDelayMs?: number }
     ) => {
       const reqStart = Date.now();
       requestCount++;
       for (const policy of policies) {
-        const verdict = policy.check(method, path, body, { requestCount });
+        const verdict = policy.check(method, requestPath, body, { requestCount });
         if (!verdict.allowed) {
           auditLog.push({
             method,
-            path,
+            path: requestPath,
             status: "BLOCKED",
             reason: verdict.reason,
             durationMs: Date.now() - reqStart,
@@ -580,23 +645,48 @@ export async function executeCodeMode(
         }
       }
 
+      const baseOrigin = new URL(options.baseUrl).origin;
+      let isCrossOrigin = false;
+      if (requestPath.startsWith("http://") || requestPath.startsWith("https://")) {
+        let targetUrl: URL;
+        try {
+          targetUrl = new URL(requestPath);
+        } catch {
+          throw new Error(`Invalid request URL: ${requestPath}`);
+        }
+        if (targetUrl.origin !== baseOrigin) {
+          isCrossOrigin = true;
+          if (!options.allowCrossOrigin) {
+            const reason = `Blocked cross-origin request to '${targetUrl.origin}' (expected base origin '${baseOrigin}').`;
+            auditLog.push({
+              method,
+              path: requestPath,
+              status: "BLOCKED",
+              reason,
+              durationMs: Date.now() - reqStart,
+            });
+            throw new Error(reason);
+          }
+        }
+      }
+
       if (options.dryRun) {
         auditLog.push({
           method,
-          path,
+          path: requestPath,
           status: "DRY_RUN_OK",
           durationMs: Date.now() - reqStart,
         });
-        return { dryRun: true, method, path, body };
+        return { dryRun: true, method, path: requestPath, body };
       }
 
       let url: string;
-      if (path.startsWith("http://") || path.startsWith("https://")) {
-        url = new URL(path).toString();
+      if (requestPath.startsWith("http://") || requestPath.startsWith("https://")) {
+        url = new URL(requestPath).toString();
       } else {
         const base = new URL(options.baseUrl);
         const basePath = base.pathname.replace(/\/+$/, "");
-        const [pathname, search] = path.split("?");
+        const [pathname, search] = requestPath.split("?");
         const cleanPath = pathname.startsWith("/") ? pathname : `/${pathname}`;
         base.pathname = `${basePath}${cleanPath}`;
         if (search !== undefined) {
@@ -618,7 +708,7 @@ export async function executeCodeMode(
             method: upperMethod,
             headers: {
               "Content-Type": "application/json",
-              ...(options.headers ?? {}),
+              ...(isCrossOrigin ? {} : (options.headers ?? {})),
             },
             body: hasPayload ? JSON.stringify(body) : undefined,
             signal: abortController.signal,
@@ -637,7 +727,7 @@ export async function executeCodeMode(
 
           auditLog.push({
             method,
-            path,
+            path: requestPath,
             status: `${response.status}`,
             durationMs: Date.now() - reqStart,
           });
