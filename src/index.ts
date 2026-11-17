@@ -74,6 +74,39 @@ export interface DryRunSummary {
   targets: Array<{ method: string; path: string; status: string }>;
 }
 
+export interface BatchRequestItem {
+  method: string;
+  path: string;
+  body?: unknown;
+}
+
+export interface BatchExecutionResult {
+  total: number;
+  succeeded: number;
+  failed: number;
+  results: Array<{
+    index: number;
+    method: string;
+    path: string;
+    ok: boolean;
+    data?: unknown;
+    error?: string;
+  }>;
+}
+
+export interface SimulationResult {
+  allowed: boolean;
+  totalChecked: number;
+  allowedCount: number;
+  blockedCount: number;
+  verdicts: Array<{
+    method: string;
+    path: string;
+    allowed: boolean;
+    reason?: string;
+  }>;
+}
+
 export interface PolicyRule {
   id: string;
   description: string;
@@ -539,21 +572,29 @@ export function searchSpec(
   endpoints: OpenApiEndpoint[],
   query: string,
   methodFilter?: string,
-  options?: { includeTypes?: boolean }
+  options?: { includeTypes?: boolean; tag?: string; limit?: number }
 ): OpenApiEndpoint[] {
-  const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+  const rawQuery = query.trim().toLowerCase();
+  const terms = rawQuery === "*" ? [] : rawQuery.split(/\s+/).filter(Boolean);
   const includeTypes = options?.includeTypes ?? true;
+  const tagFilter = options?.tag?.trim().toLowerCase();
+  const limit = Math.max(1, Math.min(options?.limit ?? 15, 50));
 
   const ranked = endpoints
     .filter((ep) => {
       if (methodFilter && ep.method !== methodFilter.toUpperCase()) return false;
+      if (tagFilter) {
+        const epTags = (ep.tags ?? []).map((t) => t.toLowerCase());
+        if (!epTags.some((t) => t.includes(tagFilter))) return false;
+      }
+      if (terms.length === 0) return true;
       const haystack =
         `${ep.method} ${ep.path} ${ep.operationId ?? ""} ${ep.summary ?? ""} ${ep.description ?? ""} ${(ep.tags ?? []).join(" ")}`.toLowerCase();
       return terms.every((t) => haystack.includes(t));
     })
     .map((ep) => ({ ep, score: scoreEndpointRelevance(ep, terms) }))
     .sort((a, b) => b.score - a.score)
-    .slice(0, 15)
+    .slice(0, limit)
     .map(({ ep }) => {
       if (includeTypes) return ep;
       return {
@@ -836,6 +877,109 @@ export async function executeCodeMode(
         items: allItems,
         totalItems: allItems.length,
         pagesFetched,
+      };
+    },
+
+    batch: async (
+      requests: BatchRequestItem[],
+      batchOptions?: { concurrency?: number; continueOnError?: boolean }
+    ): Promise<BatchExecutionResult> => {
+      if (!Array.isArray(requests) || requests.length === 0) {
+        return { total: 0, succeeded: 0, failed: 0, results: [] };
+      }
+      const concurrency = Math.max(1, Math.min(batchOptions?.concurrency ?? 5, 10));
+      const continueOnError = batchOptions?.continueOnError ?? false;
+      const results: BatchExecutionResult["results"] = new Array(requests.length);
+      let nextIdx = 0;
+
+      const worker = async () => {
+        while (nextIdx < requests.length) {
+          const idx = nextIdx++;
+          const item = requests[idx];
+          try {
+            const data = await apiHelper.request(item.method, item.path, item.body);
+            results[idx] = {
+              index: idx,
+              method: item.method,
+              path: item.path,
+              ok: true,
+              data,
+            };
+          } catch (err) {
+            const errorMsg = err instanceof Error ? err.message : String(err);
+            if (!continueOnError) {
+              throw err;
+            }
+            results[idx] = {
+              index: idx,
+              method: item.method,
+              path: item.path,
+              ok: false,
+              error: errorMsg,
+            };
+          }
+        }
+      };
+
+      const workers = Array.from(
+        { length: Math.min(concurrency, requests.length) },
+        () => worker()
+      );
+      await Promise.all(workers);
+
+      const succeeded = results.filter((r) => r?.ok).length;
+      return {
+        total: requests.length,
+        succeeded,
+        failed: requests.length - succeeded,
+        results,
+      };
+    },
+
+    simulate: (requests: BatchRequestItem[]): SimulationResult => {
+      const items = Array.isArray(requests) ? requests : [];
+      const baseOrigin = new URL(options.baseUrl).origin;
+      const verdicts: SimulationResult["verdicts"] = [];
+      let simulatedCount = requestCount;
+
+      for (const item of items) {
+        simulatedCount++;
+        let blockedReason: string | undefined;
+        for (const policy of policies) {
+          const v = policy.check(item.method, item.path, item.body, {
+            requestCount: simulatedCount,
+          });
+          if (!v.allowed) {
+            blockedReason = v.reason;
+            break;
+          }
+        }
+        if (!blockedReason && (item.path.startsWith("http://") || item.path.startsWith("https://"))) {
+          try {
+            const targetOrigin = new URL(item.path).origin;
+            if (targetOrigin !== baseOrigin && !options.allowCrossOrigin) {
+              blockedReason = `Blocked cross-origin request to '${targetOrigin}' (expected base origin '${baseOrigin}').`;
+            }
+          } catch {
+            blockedReason = `Invalid request URL: ${item.path}`;
+          }
+        }
+        verdicts.push({
+          method: item.method,
+          path: item.path,
+          allowed: !blockedReason,
+          ...(blockedReason ? { reason: blockedReason } : {}),
+        });
+      }
+
+      const allowedCount = verdicts.filter((v) => v.allowed).length;
+      const blockedCount = verdicts.length - allowedCount;
+      return {
+        allowed: blockedCount === 0,
+        totalChecked: verdicts.length,
+        allowedCount,
+        blockedCount,
+        verdicts,
       };
     },
   };

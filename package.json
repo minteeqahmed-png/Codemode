@@ -1,6 +1,6 @@
 {
   "name": "codemode",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Turn any massive OpenAPI spec into a 2-tool Code Mode MCP server (search + execute) with 99.7% fewer tokens and built-in security guardrails.",
   "author": {
     "name": "Minteeq Ahmed",
