@@ -126,12 +126,17 @@ export interface JsonRpcMessage {
  */
 export class CodeModeMcpServer {
   private endpoints: OpenApiEndpoint[] = [];
+  private availableTags: string[] = [];
   private baseUrl: string;
   private headers: Record<string, string>;
   private policies: PolicyRule[];
   private dryRun: boolean;
   private timeoutMs?: number;
   private maxResponseBytes: number;
+  private startedAt = Date.now();
+  private totalSearches = 0;
+  private totalExecutions = 0;
+  private totalBlockedCalls = 0;
 
   constructor(options: {
     spec: OpenApiSpec;
@@ -143,12 +148,28 @@ export class CodeModeMcpServer {
     maxResponseBytes?: number;
   }) {
     this.endpoints = indexOpenApiSpec(options.spec);
+    const tagSet = new Set<string>();
+    for (const ep of this.endpoints) {
+      for (const t of ep.tags ?? []) tagSet.add(t);
+    }
+    this.availableTags = [...tagSet].sort();
     this.baseUrl = this.resolveBaseUrl(options.spec, options.baseUrl);
     this.headers = options.headers ?? {};
     this.policies = options.policies ?? defaultAuditPolicies;
     this.dryRun = options.dryRun ?? false;
     this.timeoutMs = options.timeoutMs;
     this.maxResponseBytes = options.maxResponseBytes ?? 32768;
+  }
+
+  public getMetrics() {
+    return {
+      uptimeMs: Date.now() - this.startedAt,
+      endpointsIndexed: this.endpoints.length,
+      availableTagsCount: this.availableTags.length,
+      totalSearches: this.totalSearches,
+      totalExecutions: this.totalExecutions,
+      totalBlockedCalls: this.totalBlockedCalls,
+    };
   }
 
   /**
@@ -213,6 +234,10 @@ export class CodeModeMcpServer {
               description:
                 "Include compact TypeScript type hints and resolved parameters/schemas (default true)",
             },
+            tag: {
+              type: "string",
+              description: "Optional OpenAPI resource tag filter",
+            },
           },
           required: ["query"],
         },
@@ -220,14 +245,14 @@ export class CodeModeMcpServer {
       {
         name: "execute",
         description:
-          "Execute JavaScript inside an isolated sandbox with access to `await api.request(method, path, body)` and `await api.paginate(method, path, options)`. Enforces audit policies automatically.",
+          "Execute JavaScript inside an isolated sandbox with access to `await api.request(method, path, body)`, `await api.paginate(method, path, options)`, `await api.batch(requests, options)`, and `api.simulate(requests)`. Enforces audit policies automatically.",
         inputSchema: {
           type: "object",
           properties: {
             code: {
               type: "string",
               description:
-                "Async JavaScript snippet using `await api.request(method, path, body)` or `await api.paginate(method, path, options)` and returning the final filtered result.",
+                "Async JavaScript snippet using `api.request`, `api.paginate`, `api.batch`, or `api.simulate` and returning the final filtered result.",
             },
           },
           required: ["code"],
@@ -238,10 +263,13 @@ export class CodeModeMcpServer {
 
   public async handleToolCall(name: string, args: Record<string, unknown>) {
     if (name === "search") {
+      this.totalSearches++;
       const methodFilter = typeof args.method === "string" ? args.method : undefined;
       const includeTypes = typeof args.includeTypes === "boolean" ? args.includeTypes : true;
+      const tag = typeof args.tag === "string" ? args.tag : undefined;
       const matches = searchSpec(this.endpoints, String(args.query ?? ""), methodFilter, {
         includeTypes,
+        tag,
       });
       return {
         content: [
@@ -250,6 +278,7 @@ export class CodeModeMcpServer {
             text: JSON.stringify(
               {
                 totalIndexedEndpoints: this.endpoints.length,
+                availableTags: this.availableTags,
                 matchCount: matches.length,
                 endpoints: matches,
               },
@@ -262,6 +291,7 @@ export class CodeModeMcpServer {
     }
 
     if (name === "execute") {
+      this.totalExecutions++;
       try {
         const outcome = await executeCodeMode(String(args.code ?? ""), {
           baseUrl: this.baseUrl,
@@ -271,6 +301,7 @@ export class CodeModeMcpServer {
           timeoutMs: this.timeoutMs,
           maxResponseBytes: this.maxResponseBytes,
         });
+        this.totalBlockedCalls += outcome.auditLog.filter((e) => e.status === "BLOCKED").length;
         return {
           content: [
             {
@@ -281,6 +312,9 @@ export class CodeModeMcpServer {
         };
       } catch (err) {
         const errorMessage = err instanceof Error ? err.message : String(err);
+        if (errorMessage.includes("Blocked ") || errorMessage.includes("Exceeded max API calls")) {
+          this.totalBlockedCalls++;
+        }
         return {
           isError: true,
           content: [
@@ -400,8 +434,9 @@ export class CodeModeMcpServer {
           if (settled) return;
           total += chunk.length;
           if (total > 1024 * 1024) {
+            chunks.length = 0;
+            req.pause();
             fail(new Error("Request payload exceeded 1MB limit"));
-            req.destroy();
             return;
           }
           chunks.push(chunk);
@@ -439,8 +474,15 @@ export class CodeModeMcpServer {
             server: "codemode",
             endpointsIndexed: this.endpoints.length,
             tools: ["search", "execute"],
+            metrics: this.getMetrics(),
           })
         );
+        return;
+      }
+
+      if (req.method === "GET" && reqUrl.pathname === "/metrics") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(this.getMetrics()));
         return;
       }
 
@@ -486,14 +528,19 @@ export class CodeModeMcpServer {
         } catch (err) {
           const errorMessage = err instanceof Error ? err.message : String(err);
           const isTooLarge = errorMessage.includes("exceeded 1MB limit");
-          res.writeHead(isTooLarge ? 413 : 400, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              jsonrpc: "2.0",
-              id: msg?.id ?? null,
-              error: { code: -32603, message: errorMessage },
-            })
-          );
+          if (!res.headersSent) {
+            res.writeHead(isTooLarge ? 413 : 400, {
+              "Content-Type": "application/json",
+              ...(isTooLarge ? { Connection: "close" } : {}),
+            });
+            res.end(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: msg?.id ?? null,
+                error: { code: -32603, message: errorMessage },
+              })
+            );
+          }
           return;
         }
       }
@@ -537,7 +584,10 @@ export interface ApiPreset {
   description?: string;
 }
 
-export const API_PRESETS: Record<"cloudflare" | "github" | "stripe" | "kubernetes", ApiPreset> = {
+export const API_PRESETS: Record<
+  "cloudflare" | "github" | "stripe" | "kubernetes" | "openai" | "slack" | "digitalocean",
+  ApiPreset
+> = {
   cloudflare: {
     name: "Cloudflare",
     spec: "https://raw.githubusercontent.com/cloudflare/api-schemas/main/openapi.json",
@@ -561,6 +611,24 @@ export const API_PRESETS: Record<"cloudflare" | "github" | "stripe" | "kubernete
     spec: "https://raw.githubusercontent.com/kubernetes/kubernetes/master/api/openapi-spec/swagger.json",
     baseUrl: "https://kubernetes.default.svc",
     description: "Kubernetes Cluster API",
+  },
+  openai: {
+    name: "OpenAI",
+    spec: "https://raw.githubusercontent.com/openai/openai-openapi/master/openapi.yaml",
+    baseUrl: "https://api.openai.com/v1",
+    description: "OpenAI REST API v1",
+  },
+  slack: {
+    name: "Slack",
+    spec: "https://raw.githubusercontent.com/slackapi/slack-api-specs/master/web-api/slack_web_openapi_v2.json",
+    baseUrl: "https://slack.com/api",
+    description: "Slack Web API",
+  },
+  digitalocean: {
+    name: "DigitalOcean",
+    spec: "https://raw.githubusercontent.com/digitalocean/openapi/main/specification/DigitalOcean-public.v2.yaml",
+    baseUrl: "https://api.digitalocean.com/v2",
+    description: "DigitalOcean Public API v2",
   },
 };
 
